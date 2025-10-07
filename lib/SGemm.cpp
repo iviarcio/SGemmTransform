@@ -117,7 +117,7 @@ applyTileToGemm(RewriterBase &rewriter, Operation *transformOp, Operation *targe
   if (!tilingInterfaceOp)
     return transformOp->emitError("only TilingInterface ops are supported");
 
-  // --- Outer level: (Mc, Kc, Nc) over (i, k, j) with interchange {0,2,1} -> loops order (i, j, k).
+  // Outer level: (Mc, Kc, Nc) over (i, k, j) with interchange {0,2,1} -> loops order (i, j, k).
   GemmTileSizes ts = computeGemmTiles(mK, arch);
 
   SmallVector<int64_t, 3> outerTileSz = {ts.Mc, ts.Kc, ts.Nc};
@@ -148,7 +148,7 @@ applyTileToGemm(RewriterBase &rewriter, Operation *transformOp, Operation *targe
   }
 
 
-  // --- Inner level: (mr, nr) on inner tiled op.
+  // Inner level: (mr, nr) on inner tiled op.
   Operation *innerOp = outerRes->tiledOps.front();
 
   SmallVector<int64_t, 3> innerTileSz = {ts.mr, /*K*/ 0, ts.nr};
@@ -181,7 +181,7 @@ applyTileToGemm(RewriterBase &rewriter, Operation *transformOp, Operation *targe
     rewriter.eraseOp(innerTilingInterfaceOp);
   }
 
-  // --- Report back the tiled inner op + all loops (outer + inner)
+  // Report back the tiled inner op + all loops (outer + inner)
   tiledOps.push_back(innerRes->tiledOps.front());
   for (Operation *loop : outerRes->loops) loopOps.push_back(loop);
   for (Operation *loop : innerRes->loops) loopOps.push_back(loop);
