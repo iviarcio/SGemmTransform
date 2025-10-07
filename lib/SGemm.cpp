@@ -108,7 +108,7 @@ static GemmTileSizes computeGemmTiles(const mKInfo &mK, const ArchInfo &arch) {
 static LogicalResult
 applyTileToGemm(RewriterBase &rewriter, Operation *transformOp, Operation *target,
                 const mKInfo &mK, const ArchInfo &arch,
-                SmallVector<Operation*, 7> &outResults) {
+                SmallVector<Operation*, 6> &outResults) {
 
   SmallVector<Operation *> tiledOps;
   SmallVector<Operation *> loopOps;
@@ -135,16 +135,23 @@ applyTileToGemm(RewriterBase &rewriter, Operation *transformOp, Operation *targe
   if (failed(outerRes))
     return transformOp->emitError("First level tiling for GEMM failed.");
 
-  // Replace tiled/fused values
-  rewriter.replaceOp(
-      tilingInterfaceOp,
-      outerRes->loops.empty() ? outerRes->tiledOps.front()->getResults()
-                              : outerRes->loops.front()->getResults());
+  // Outer replace: use loop results when loops exist.
+  if (!outerRes->loops.empty()) {
+    // The scf.for returns the assembled tensor via yield -> results().
+    rewriter.replaceOp(tilingInterfaceOp, outerRes->loops.front()->getResults());
+  } else if (!outerRes->tiledOps.empty()) {
+    // Degenerate case (no loops): fall back to the tiled op result.
+    rewriter.replaceOp(tilingInterfaceOp, outerRes->tiledOps.front()->getResults());
+  } else {
+    // No tiled op produced: a safe fallback, just erase.
+    rewriter.eraseOp(tilingInterfaceOp);
+  }
 
-  // --- Inner level: (mr, 0, nr) on inner tiled op.
+
+  // --- Inner level: (mr, nr) on inner tiled op.
   Operation *innerOp = outerRes->tiledOps.front();
 
-  SmallVector<int64_t, 3> innerTileSz = {ts.mr, 0, ts.nr};
+  SmallVector<int64_t, 3> innerTileSz = {ts.mr, /*K*/ 0, ts.nr};
   SmallVector<OpFoldResult> innerTileOfr =
       getAsIndexOpFoldResult(rewriter.getContext(), innerTileSz);
 
@@ -165,22 +172,26 @@ applyTileToGemm(RewriterBase &rewriter, Operation *transformOp, Operation *targe
   if (failed(innerRes))
     return transformOp->emitError("Second level tiling for GEMM failed.");
 
-  rewriter.replaceOp(
-      innerTilingInterfaceOp,
-      innerRes->loops.empty() ? innerRes->tiledOps.front()->getResults()
-                              : innerRes->loops.front()->getResults());
+  // Inner replace: same rule as outer.
+  if (!innerRes->loops.empty()) {
+    rewriter.replaceOp(innerTilingInterfaceOp, innerRes->loops.front()->getResults());
+  } else if (!innerRes->tiledOps.empty()) {
+    rewriter.replaceOp(innerTilingInterfaceOp, innerRes->tiledOps.front()->getResults());
+  } else {
+    rewriter.eraseOp(innerTilingInterfaceOp);
+  }
 
   // --- Report back the tiled inner op + all loops (outer + inner)
   tiledOps.push_back(innerRes->tiledOps.front());
   for (Operation *loop : outerRes->loops) loopOps.push_back(loop);
   for (Operation *loop : innerRes->loops) loopOps.push_back(loop);
 
-  // Collect in outResults: [tiledInnerOp, loop0..loop5]
+  // Collect only real ops: [tiledInnerOp, loop...];
   outResults.clear();
-  outResults.push_back(tiledOps.front());
-  // Reserve up to 6 loops like SConv; if fewer exist, push what we have.
-  for (Operation *L : loopOps) outResults.push_back(L);
-  while (outResults.size() < 7) outResults.push_back(nullptr);
+  if (!tiledOps.empty() && tiledOps.front())
+    outResults.push_back(tiledOps.front());
+  for (Operation *L : loopOps)
+    if (L) outResults.push_back(L);
 
   return success();
 }
@@ -261,7 +272,7 @@ transform::SGemmOp::apply(transform::TransformRewriter &rewriter,
 
   // Initialize the default values of mKInfo & ArchInfo.
   // It's dependent of the target machine.
-  mKInfo mK = {4, 32, 128};
+  mKInfo mK = {8, 16, 128};
   ArchInfo arch = {
       (uint32_t)(32768),
       (uint32_t)(1048576),
@@ -312,7 +323,7 @@ transform::SGemmOp::apply(transform::TransformRewriter &rewriter,
 
   // temporary variables to store all sgemm transformation
   SmallVector<Operation*> tempResultGemms;
-  SmallVector<SmallVector<Operation*, 6>> tempResultLoops;
+  SmallVector<SmallVector<Operation*, 5>> tempResultLoops;
 
   // Get context and gemmOps
   MLIRContext *context = rewriter.getContext();
@@ -326,18 +337,20 @@ transform::SGemmOp::apply(transform::TransformRewriter &rewriter,
       if (failed(res))
         return emitSilenceableError() << "failed to generalize linalg.matmul";
 
-      SmallVector<Operation*, 7> localResults;
+      SmallVector<Operation*, 6> localResults;
 
       linalg::GenericOp genericOp = *res;
       if (failed(applyTileToGemm(rewriter, getOperation(), genericOp.getOperation(), mK, arch, localResults)))
         return emitSilenceableError() << "Failed to apply tiling.";
 
-      // The first result is the transformed linalg.generic (uKernel)
-      tempResultGemms.push_back(localResults[0]);
+      // First result: tiled uKernel (guard against missing/nullable)
+      if (!localResults.empty() && localResults[0])
+        tempResultGemms.push_back(localResults[0]);
 
-      // Following, the generated loops
-      SmallVector<Operation*, 6> loopSet;
-      for (int i = 1; i <= 6; ++i) loopSet.push_back(localResults[i]);
+      // Following: generated loops (push only non-null)
+      SmallVector<Operation*, 5> loopSet;
+      for (size_t i = 1; i < localResults.size(); ++i)
+        if (localResults[i]) loopSet.push_back(localResults[i]);
       tempResultLoops.push_back(loopSet);
 
     }
@@ -346,14 +359,25 @@ transform::SGemmOp::apply(transform::TransformRewriter &rewriter,
   // Flatten tempResultLoops
   SmallVector<Operation*> flatResultLoops;
   for (const auto &loopSet : tempResultLoops) {
-    flatResultLoops.append(loopSet.begin(), loopSet.end());
+    for (Operation *L : loopSet)
+      if (L) flatResultLoops.push_back(L);
   }
 
-  // Store results properly in TransformResults
+  // Also filter nulls from tempResultGemms, just in case.
+  {
+    SmallVector<Operation*> filtered;
+    filtered.reserve(tempResultGemms.size());
+    for (Operation *op : tempResultGemms)
+      if (op) filtered.push_back(op);
+    tempResultGemms.swap(filtered);
+  }
+
+  // Store results properly in TransformResults (no nullptrs allowed)
   results.set(getOperation()->getOpResult(0), tempResultGemms);
   results.set(getOperation()->getOpResult(1), flatResultLoops);
 
   return DiagnosedSilenceableFailure::success();
+
 }
 
 void transform::SGemmOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {

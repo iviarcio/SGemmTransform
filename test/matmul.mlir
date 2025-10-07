@@ -11,4 +11,3 @@ module {
     return %C : !c_t
   }
 }
-
