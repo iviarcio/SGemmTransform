@@ -186,4 +186,11 @@ struct GemmTileSizes {
   int64_t mr = 0, nr = 0;
 };
 
+struct PackedAB {
+  Value aPack;
+  Value bPack;
+  RankedTensorType aPackTy;
+  RankedTensorType bPackTy;
+};
+
 #endif // SGEMM_H
