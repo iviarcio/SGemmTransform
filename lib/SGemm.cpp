@@ -83,6 +83,52 @@ void SGemm::init() {
 // Packing helpers (row-panel for A, col-panel for B)
 //===----------------------------------------------------------------------===//
 
+/// Return the innermost scf::ForOp that encloses `op` (or null if none).
+static scf::ForOp getInnermostEnclosingFor(Operation *op) {
+  if (!op) return nullptr;
+  Operation *cur = op->getParentOp();
+  scf::ForOp innermost = nullptr;
+  while (cur) {
+    if (auto forOp = dyn_cast<scf::ForOp>(cur))
+      innermost = forOp;
+    cur = cur->getParentOp();
+  }
+  return innermost;
+}
+
+/// Return the ExtractSliceOp that ultimately produces `v`, or null if none.
+static tensor::ExtractSliceOp getSliceProducerOrNull(Value v) {
+  Value cur = v;
+  while (Operation *def = cur.getDefiningOp()) {
+    if (auto slice = dyn_cast<tensor::ExtractSliceOp>(def))
+      return slice;
+    // Skip through trivial wrappers.
+    continue;
+  }
+  return nullptr;
+}
+
+/// Conservatively check whether `slice` is invariant in the current `loop`.
+static bool isExtractSliceInvariantToLoop(tensor::ExtractSliceOp slice,
+                                          scf::ForOp loop) {
+  if (!loop) return true;
+  auto *loopBody = loop.getBody();
+  Value iv = loop.getInductionVar();
+  for (Value v : slice->getOperands()) {
+    if (!v) continue;
+    if (v == iv) return false;
+    Operation *def = v.getDefiningOp();
+    if (!def) {
+      // if it belongs to the loop body, be conservative.
+      if (auto barg = dyn_cast<BlockArgument>(v))
+        if (barg.getOwner() == loopBody) return false;
+      continue;
+    }
+    if (loop->isAncestor(def)) return false;
+  }
+  return true;
+}
+
 /// Compute packed type for A: from [Mc, Kc] to [Mc/mr, Kc, mr].
 static RankedTensorType
 computeAPackedType(RankedTensorType aType, int64_t mr) {
@@ -103,7 +149,8 @@ computeBPackedType(RankedTensorType bType, int64_t nr) {
   return RankedTensorType::get(newShape, bType.getElementType());
 }
 
-/// Build affine maps for A-pack:  in:  (i,k)  -> out: (io, k, ii) with io=floor(i/mr), ii=mod(i,mr)
+/// Build affine maps for A-pack:  in:  (i,k)  -> out: (io, k, ii)
+/// with io=floor(i/mr), ii=mod(i,mr)
 static void buildAPackMaps(MLIRContext *ctx, int64_t mr,
                            AffineMap &inMap, AffineMap &outMap) {
   // dims: (i,k)
@@ -115,7 +162,8 @@ static void buildAPackMaps(MLIRContext *ctx, int64_t mr,
   outMap = AffineMap::get(/*dims=*/2, /*symbols=*/0, ArrayRef<AffineExpr>{io, k, ii}, ctx);
 }
 
-/// Build affine maps for B-pack:  in:  (k,j)  -> out: (k, jo, ji) with jo=floor(j/nr), ji=mod(j,nr)
+/// Build affine maps for B-pack:  in:  (k,j)  -> out: (k, jo, ji)
+/// with jo=floor(j/nr), ji=mod(j,nr)
 static void buildBPackMaps(MLIRContext *ctx, int64_t nr,
                            AffineMap &inMap, AffineMap &outMap) {
   // dims: (k,j)
@@ -127,67 +175,68 @@ static void buildBPackMaps(MLIRContext *ctx, int64_t nr,
   outMap = AffineMap::get(/*dims=*/2, /*symbols=*/0, ArrayRef<AffineExpr>{k, jo, ji}, ctx);
 }
 
-/// Materialize A_pack and B_pack for the given inner ukernel (linalg.generic).
-/// Assumes ukernel reads A(i,k), B(k,j) and produces C(i,j) inside inner tile.
-/// Returns {A_pack, B_pack} and their types; leaves old inputs untouched.
-static FailureOr<PackedAB>
-buildPacksForUkernel(RewriterBase &rewriter, linalg::GenericOp ukernel,
-                     int64_t mr, int64_t nr) {
-  Location loc = ukernel.getLoc();
-  MLIRContext *ctx = rewriter.getContext();
+/// Build A_pack at a precise insertion point. If `afterOp` != nullptr,
+/// insert right AFTER it; otherwise insert BEFORE `beforeOp`.
+/// in  : A tile type [Mc, Kc]
+/// out : A_pack type [Mc/mr, Kc, mr]
+static FailureOr<std::pair<Value, RankedTensorType>>
+buildAPackAt(RewriterBase &rewriter, Location loc, Value A, int64_t mr,
+             Operation *afterOp, Operation *beforeOp) {
+  OpBuilder::InsertionGuard g(rewriter);
 
-  // Expect 2 inputs (A,B) and 1 output (Ctile).
-  if (ukernel.getNumDpsInputs() != 2 || ukernel.getNumDpsInits() != 1)
+  if (afterOp) {
+    rewriter.setInsertionPointAfter(afterOp);
+  } else if (beforeOp) {
+    rewriter.setInsertionPoint(beforeOp);
+  } else {
     return failure();
-
-  Value A = ukernel.getDpsInputs()[0];
-  Value B = ukernel.getDpsInputs()[1];
+  }
 
   auto aType = dyn_cast<RankedTensorType>(A.getType());
-  auto bType = dyn_cast<RankedTensorType>(B.getType());
-  if (!aType || !bType || aType.getRank() != 2 || bType.getRank() != 2)
-    return failure();
+  if (!aType || aType.getRank() != 2) return failure();
 
-  // Compute packed types.
-  RankedTensorType aPackTy = computeAPackedType(aType, mr);
-  RankedTensorType bPackTy = computeBPackedType(bType, nr);
-
-  // Create the iterator types
-  auto parallel = utils::IteratorType::parallel;
-  auto reduction = utils::IteratorType::reduction;
-  SmallVector<utils::IteratorType> iters = {parallel, parallel};
-
-  // Build A_pack = linalg.generic(in: A) outs: tensor.empty aPackTy
+  auto aPackTy = computeAPackedType(aType, mr);
   AffineMap aInMap, aOutMap;
-  buildAPackMaps(ctx, mr, aInMap, aOutMap);
+  buildAPackMaps(rewriter.getContext(), mr, aInMap, aOutMap);
 
-  Value aEmpty = rewriter.create<tensor::EmptyOp>(loc, aPackTy.getShape(),
-                                                  aPackTy.getElementType());
+  Value aEmpty = rewriter.create<tensor::EmptyOp>(
+      loc, aPackTy.getShape(), aPackTy.getElementType());
+
   auto aPack = rewriter.create<linalg::GenericOp>(
-      loc, TypeRange{aPackTy}, /*inputs=*/ValueRange{A}, /*outputs=*/ValueRange{aEmpty},
-      /*indexingMaps=*/ArrayRef<AffineMap>{aInMap, aOutMap},
-      /*iteratorTypes=*/iters, // in dims: (i,k) -> parallel over both
-      [&](OpBuilder &b, Location /*nestedLoc*/, ValueRange args) {
-        // Pass-through pack: just forward the scalar
-        b.create<linalg::YieldOp>(loc, args[0]);
+      loc, TypeRange{aPackTy}, ValueRange{A}, ValueRange{aEmpty},
+      ArrayRef<AffineMap>{aInMap, aOutMap},
+      SmallVector<utils::IteratorType>{utils::IteratorType::parallel,
+                                       utils::IteratorType::parallel},
+      [&](OpBuilder &b, Location nloc, ValueRange args) {
+        b.create<linalg::YieldOp>(nloc, args[0]);
       });
 
-  // Build B_pack = linalg.generic(in: B) outs: tensor.empty bPackTy
+  return std::make_pair(aPack.getResult(0), aPackTy);
+}
+
+// Build B_pack at the current insertion point.
+// in  : B tile type [Kc, Nc]
+// out : B_pack type [Kc, Nc/nr, nr]
+static FailureOr<std::pair<Value, RankedTensorType>>
+buildBPackAt(RewriterBase &rewriter, Location loc, Value B, int64_t nr) {
+  auto bType = dyn_cast<RankedTensorType>(B.getType());
+  if (!bType || bType.getRank() != 2) return failure();
+  auto bPackTy = computeBPackedType(bType, nr);
+
   AffineMap bInMap, bOutMap;
-  buildBPackMaps(ctx, nr, bInMap, bOutMap);
+  buildBPackMaps(rewriter.getContext(), nr, bInMap, bOutMap);
 
   Value bEmpty = rewriter.create<tensor::EmptyOp>(loc, bPackTy.getShape(),
                                                   bPackTy.getElementType());
   auto bPack = rewriter.create<linalg::GenericOp>(
-      loc, TypeRange{bPackTy}, /*inputs=*/ValueRange{B}, /*outputs=*/ValueRange{bEmpty},
-      /*indexingMaps=*/ArrayRef<AffineMap>{bInMap, bOutMap},
-      /*iteratorTypes=*/iters,
-      [&](OpBuilder &b, Location /*nestedLoc*/, ValueRange args) {
-        b.create<linalg::YieldOp>(loc, args[0]);
+      loc, TypeRange{bPackTy}, ValueRange{B}, ValueRange{bEmpty},
+      ArrayRef<AffineMap>{bInMap, bOutMap},
+      SmallVector<utils::IteratorType>{utils::IteratorType::parallel,
+                                       utils::IteratorType::parallel},
+      [&](OpBuilder &b, Location nloc, ValueRange args) {
+        b.create<linalg::YieldOp>(nloc, args[0]);
       });
-
-  PackedAB out{aPack.getResult(0), bPack.getResult(0), aPackTy, bPackTy};
-  return out;
+  return std::make_pair(bPack.getResult(0), bPackTy);
 }
 
 /// Rewrite ukernel (linalg.generic) to read from A_pack / B_pack.
@@ -261,8 +310,10 @@ rewriteUkernelToUsePackedAB(RewriterBase &rewriter, linalg::GenericOp ukernel,
 
 
 //===----------------------------------------------------------------------===//
-// GEMM tiling (2-level) - outer then inner
+// Tiling Helpers
 //===----------------------------------------------------------------------===//
+
+/// Selects block (tiling) sizes for a GEMM at two levels  
 static GemmTileSizes computeGemmTiles(const mKInfo &mK, const ArchInfo &arch) {
 
   GemmTileSizes ts;
@@ -278,7 +329,7 @@ static GemmTileSizes computeGemmTiles(const mKInfo &mK, const ArchInfo &arch) {
   ts.Nc = ts.nr * 4;         // 4 microkernels stacked on N
   ts.Kc = 128;               // conservative reduction chunk (tune by arch)
 
-  // We can refine later with arch.l2_size etc. (GEMM-CSA ?).
+  // We can refine later with arch.l2_size (VTCM-size ?).
   (void)arch;
   return ts;
 }
@@ -327,7 +378,6 @@ applyTileToGemm(RewriterBase &rewriter, Operation *transformOp, Operation *targe
     // No tiled op produced: a safe fallback, just erase.
     rewriter.eraseOp(tilingInterfaceOp);
   }
-
 
   // Inner level: (mr, nr) on inner tiled op.
   Operation *innerOp = outerRes->tiledOps.front();
@@ -524,44 +574,73 @@ transform::SGemmOp::apply(transform::TransformRewriter &rewriter,
       if (failed(applyTileToGemm(rewriter, getOperation(), genericOp.getOperation(), mK, arch, localResults)))
         return emitSilenceableError() << "Failed to apply tiling.";
 
-
-      // First result: tiled uKernel (guard against missing/nullable)
+      // First result in localResults contain the tiled uKernel (guard against missing/nullable)
       if (!localResults.empty() && localResults[0]) {
         auto ukernel = dyn_cast<linalg::GenericOp>(localResults[0]);
         if (ukernel) {
           int64_t mr = mK.nrows;
           int64_t nr = mK.ncols;
-          // Build A_pack and B_pack right before ukernel.
-          rewriter.setInsertionPoint(ukernel);
-          auto packs = buildPacksForUkernel(rewriter, ukernel, mr, nr);
-          if (succeeded(packs)) {
-            // Rewrite ukernel to consume packed tensors.
-            auto newUkernelOr =
-                rewriteUkernelToUsePackedAB(rewriter, ukernel, packs->aPack, packs->bPack);
 
+          Value A = ukernel.getDpsInputs()[0];
+          Value B = ukernel.getDpsInputs()[1];
+
+          // Try to hoist A's slice outside the innermost N-loop
+          // Select the valid IPs to aPack (A may be hoisted).
+          Operation *afterA = nullptr;
+          Operation *beforeA = ukernel.getOperation();
+          if (auto innerFor = getInnermostEnclosingFor(ukernel)) {
+            // Find the slice that produces A
+            if (auto aSlice = getSliceProducerOrNull(A)) {
+              if (isExtractSliceInvariantToLoop(aSlice, innerFor)) {
+                // Move the slice that feeds A outside the inner loop.
+                aSlice->moveBefore(innerFor);
+                afterA = aSlice.getOperation(); // we'll insert A_pack right AFTER this slice
+              }
+            }
+          }
+          // Build A_pack at the IP (possibly hoisted)
+          auto aPackOr = buildAPackAt(rewriter, ukernel.getLoc(), A, mr, afterA, beforeA);
+          if (failed(aPackOr)) {
+            return emitSilenceableError() << "failed to build A_pack";
+          }
+          Value aPack = aPackOr->first;
+
+          // Build B_pack right before ukernel
+          OpBuilder::InsertionGuard g(rewriter);
+          rewriter.setInsertionPoint(ukernel);
+          auto bPackOr = buildBPackAt(rewriter, ukernel.getLoc(), B, nr); // seu helper B
+          if (failed(bPackOr)) {
+            return emitSilenceableError() << "failed to build B_pack";
+          }
+          Value bPack = bPackOr->first;
+
+          // If both packs exist, rewrite the ukernel to consume them.
+          if (aPack && bPack) {
+            auto newUkernelOr =
+                rewriteUkernelToUsePackedAB(rewriter, ukernel, aPack, bPack);
+            // Update localResults[0] with ukernel
             if (succeeded(newUkernelOr)) {
               linalg::GenericOp newUkernel = *newUkernelOr;
+              newUkernel->setAttrs({{"microkernel", rewriter.getUnitAttr()}});
               if (!localResults.empty())
                 localResults[0] = newUkernel.getOperation();
-            } else {
-              // If rewrite failed, keep the old ukernel handle as-is (already valid).
             }
           }
         }
       }
 
-      // First result: tiled uKernel (guard against missing/nullable)
+      // Store tiled uKernel (localResults[0])
       if (!localResults.empty() && localResults[0])
         tempResultGemms.push_back(localResults[0]);
 
-      // Following: generated loops (push only non-null)
+      // Following, store the generated loops
       SmallVector<Operation*, 5> loopSet;
       for (size_t i = 1; i < localResults.size(); ++i)
         if (localResults[i]) loopSet.push_back(localResults[i]);
       tempResultLoops.push_back(loopSet);
 
     }
-  }
+  } // For targetOps
 
   // Flatten tempResultLoops
   SmallVector<Operation*> flatResultLoops;
@@ -579,7 +658,7 @@ transform::SGemmOp::apply(transform::TransformRewriter &rewriter,
     tempResultGemms.swap(filtered);
   }
 
-  // Store results properly in TransformResults (no nullptrs allowed)
+  // Store results properly in TransformResults
   results.set(getOperation()->getOpResult(0), tempResultGemms);
   results.set(getOperation()->getOpResult(1), flatResultLoops);
 
