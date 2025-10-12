@@ -83,19 +83,6 @@ void SGemm::init() {
 // Packing helpers (row-panel for A, col-panel for B)
 //===----------------------------------------------------------------------===//
 
-/// Return the innermost scf::ForOp that encloses `op` (or null if none).
-static scf::ForOp getInnermostEnclosingFor(Operation *op) {
-  if (!op) return nullptr;
-  Operation *cur = op->getParentOp();
-  scf::ForOp innermost = nullptr;
-  while (cur) {
-    if (auto forOp = dyn_cast<scf::ForOp>(cur))
-      innermost = forOp;
-    cur = cur->getParentOp();
-  }
-  return innermost;
-}
-
 /// Return the ExtractSliceOp that ultimately produces `v`, or null if none.
 static tensor::ExtractSliceOp getSliceProducerOrNull(Value v) {
   Value cur = v;
@@ -210,7 +197,7 @@ buildAPackAt(RewriterBase &rewriter, Location loc, Value A, int64_t mr,
       [&](OpBuilder &b, Location nloc, ValueRange args) {
         b.create<linalg::YieldOp>(nloc, args[0]);
       });
-
+  aPack->setAttrs({{"APacking", rewriter.getUnitAttr()}});
   return std::make_pair(aPack.getResult(0), aPackTy);
 }
 
@@ -236,6 +223,7 @@ buildBPackAt(RewriterBase &rewriter, Location loc, Value B, int64_t nr) {
       [&](OpBuilder &b, Location nloc, ValueRange args) {
         b.create<linalg::YieldOp>(nloc, args[0]);
       });
+  bPack->setAttrs({{"BPacking", rewriter.getUnitAttr()}});
   return std::make_pair(bPack.getResult(0), bPackTy);
 }
 
@@ -307,7 +295,6 @@ rewriteUkernelToUsePackedAB(RewriterBase &rewriter, linalg::GenericOp ukernel,
   rewriter.replaceOp(ukernel, newUkernel->getResults());
   return newUkernel;
 }
-
 
 //===----------------------------------------------------------------------===//
 // Tiling Helpers
@@ -588,7 +575,8 @@ transform::SGemmOp::apply(transform::TransformRewriter &rewriter,
           // Select the valid IPs to aPack (A may be hoisted).
           Operation *afterA = nullptr;
           Operation *beforeA = ukernel.getOperation();
-          if (auto innerFor = getInnermostEnclosingFor(ukernel)) {
+          // Get the innermost enclosing For
+          if (auto innerFor = dyn_cast<scf::ForOp>(localResults[5])) {
             // Find the slice that produces A
             if (auto aSlice = getSliceProducerOrNull(A)) {
               if (isExtractSliceInvariantToLoop(aSlice, innerFor)) {
