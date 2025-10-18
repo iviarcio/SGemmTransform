@@ -300,25 +300,35 @@ rewriteUkernelToUsePackedAB(RewriterBase &rewriter, linalg::GenericOp ukernel,
 // Tiling Helpers
 //===----------------------------------------------------------------------===//
 
-/// Selects block (tiling) sizes for a GEMM at two levels  
-static GemmTileSizes computeGemmTiles(const mKInfo &mK, const ArchInfo &arch) {
+static inline int64_t roundDownToMultiple(int64_t x, int64_t m) {
+  if (m <= 0) return x;
+  return (x / m) * m;
+}
 
-  GemmTileSizes ts;
-  // Map SConv-style knobs into GEMM intuitively:
-  //   - mr <- nrows (rows of micro-kernel)
-  //   - nr <- ncols (cols of micro-kernel)
-  //   - Choose outer tiles as multiples of mr/nr and a modest Kc.
-  ts.mr = std::max<int64_t>(mK.nrows, 4); // e.g., 4..16
-  ts.nr = std::max<int64_t>(mK.ncols, 8); // e.g., 8..32
+/// Adaptive selection based on problem size and micro-kernel shape.
+static GemmTileSizes chooseGemmTileSizes(int64_t M, int64_t N, int64_t K,
+                                         int64_t mr, int64_t nr) {
+  const int64_t targetMBlocks = 8;   // try 8 mr-blocks along M
+  const int64_t targetNBlocks = 4;   // try 4 nr-blocks along N
+  const int64_t KcTarget      = 128; // conservative default for fp32
+  const int64_t KAlign        = 8;   // align reduction chunk
 
-  // Outer: pick Mc/Nc as a few microkernels; Kc as a reduction chunk.
-  ts.Mc = ts.mr * 8;         // 8 microkernels stacked on M
-  ts.Nc = ts.nr * 4;         // 4 microkernels stacked on N
-  ts.Kc = 128;               // conservative reduction chunk (tune by arch)
+  // mr/nr at least as provided
+  int64_t useMr = std::max<int64_t>(mr, 1);
+  int64_t useNr = std::max<int64_t>(nr, 1);
 
-  // We can refine later with arch.l2_size (VTCM-size ?).
-  (void)arch;
-  return ts;
+  // Adaptive Mc/Nc and multiples of mr/nr, without exceeding M/N
+  int64_t maxMBlocks = std::max<int64_t>(1, (M > 0 && useMr > 0) ? (M / useMr) : 1);
+  int64_t maxNBlocks = std::max<int64_t>(1, (N > 0 && useNr > 0) ? (N / useNr) : 1);
+  int64_t Mc = std::max<int64_t>(useMr, std::min<int64_t>(targetMBlocks, maxMBlocks) * useMr);
+  int64_t Nc = std::max<int64_t>(useNr, std::min<int64_t>(targetNBlocks, maxNBlocks) * useNr);
+
+  // Preferable Kc, limited by K e alined
+  int64_t Kc = (K > 0) ? std::min<int64_t>(KcTarget, K) : KcTarget;
+  Kc = roundDownToMultiple(Kc, KAlign);
+  if (Kc <= 0) Kc = (K > 0) ? std::min<int64_t>(K, KAlign) : KAlign;
+
+  return {Mc, Nc, Kc, useMr, useNr};
 }
 
 /// Apply 2-level tiling to a linalg op with iterators [i (M) : parallel, k (K) : reduction, j (N) : parallel].
@@ -336,9 +346,43 @@ applyTileToGemm(RewriterBase &rewriter, Operation *transformOp, Operation *targe
   if (!tilingInterfaceOp)
     return transformOp->emitError("only TilingInterface ops are supported");
 
-  // Outer level: (Mc, Kc, Nc) over (i, k, j) with interchange {0,2,1} -> loops order (i, j, k).
-  GemmTileSizes ts = computeGemmTiles(mK, arch);
+  // Infer problem sizes (M, N, K) from the target op types.
+  // For linalg.matmul: A:[M,K], B:[K,N], C:[M,N].
+  int64_t M = -1, N = -1, K = -1;
+  if (auto linalgOp = dyn_cast<linalg::LinalgOp>(target)) {
+    auto A = linalgOp.getDpsInputs()[0];
+    auto B = linalgOp.getDpsInputs()[1];
+    auto C = linalgOp.getDpsInits()[0];
 
+    if (auto aTy = dyn_cast<RankedTensorType>(A.getType())) {
+      if (aTy.getRank() == 2) {
+        // A:[M,K]
+        M = aTy.getShape()[0];
+        K = aTy.getShape()[1];
+      }
+    }
+    if (auto bTy = dyn_cast<RankedTensorType>(B.getType())) {
+      if (bTy.getRank() == 2) {
+        // B:[K,N]
+        if (K < 0) K = bTy.getShape()[0];
+        N = bTy.getShape()[1];
+      }
+    }
+    if (auto cTy = dyn_cast<RankedTensorType>(C.getType())) {
+      if (cTy.getRank() == 2) {
+        // C:[M,N]
+        if (M < 0) M = cTy.getShape()[0];
+        if (N < 0) N = cTy.getShape()[1];
+      }
+    }
+  }
+
+  // Fall back gracefully if any dim is dynamic/unknown.
+  int64_t mr = mK.nrows;
+  int64_t nr = mK.ncols;
+  GemmTileSizes ts = chooseGemmTileSizes(M, N, K, mr, nr);
+
+  // Outer (Mc,Kc,Nc) then inner (mr,0,nr) as before
   SmallVector<int64_t, 3> outerTileSz = {ts.Mc, ts.Kc, ts.Nc};
   SmallVector<OpFoldResult> outerTileOfr =
       getAsIndexOpFoldResult(rewriter.getContext(), outerTileSz);
@@ -561,58 +605,70 @@ transform::SGemmOp::apply(transform::TransformRewriter &rewriter,
       if (failed(applyTileToGemm(rewriter, getOperation(), genericOp.getOperation(), mK, arch, localResults)))
         return emitSilenceableError() << "Failed to apply tiling.";
 
-      // First result in localResults contain the tiled uKernel (guard against missing/nullable)
-      if (!localResults.empty() && localResults[0]) {
-        auto ukernel = dyn_cast<linalg::GenericOp>(localResults[0]);
-        if (ukernel) {
-          int64_t mr = mK.nrows;
-          int64_t nr = mK.ncols;
+      // localResults[0] contain the tiled uKernel (guard against missing/nullable)
+      auto ukernel = dyn_cast<linalg::GenericOp>(localResults[0]);
+      if (ukernel) {
+        int64_t mr = mK.nrows;
+        int64_t nr = mK.ncols;
 
-          Value A = ukernel.getDpsInputs()[0];
-          Value B = ukernel.getDpsInputs()[1];
+        Value A = ukernel.getDpsInputs()[0]; // slice local [Mc_local, K_local]
+        Value B = ukernel.getDpsInputs()[1]; // slice local [K_local, N_local]
 
-          // Try to hoist A's slice outside the innermost N-loop
-          // Select the valid IPs to aPack (A may be hoisted).
-          Operation *afterA = nullptr;
-          Operation *beforeA = ukernel.getOperation();
-          // Get the innermost enclosing For
-          if (auto innerFor = dyn_cast<scf::ForOp>(localResults[5])) {
-            // Find the slice that produces A
-            if (auto aSlice = getSliceProducerOrNull(A)) {
-              if (isExtractSliceInvariantToLoop(aSlice, innerFor)) {
-                // Move the slice that feeds A outside the inner loop.
-                aSlice->moveBefore(innerFor);
-                afterA = aSlice.getOperation(); // we'll insert A_pack right AFTER this slice
-              }
+        // If the local width of this ukernel (Nc_local) is not a multiple of nr,
+        // skip packing on N-tail (simple fallback)
+        if (auto bTy = dyn_cast<RankedTensorType>(B.getType())) {
+          if (bTy.getRank() == 2) {
+            int64_t N_local = bTy.getShape()[1];
+            if (N_local == ShapedType::kDynamic || nr == 0 || (N_local % nr) != 0) {
+              // keep ukernel as-is (no A/B pack); optional debug attr:
+              ukernel->setAttr("RemainderN",
+                rewriter.getI64IntegerAttr(N_local == ShapedType::kDynamic ? -1 : N_local));
+              // continue to next ukernel
+              continue; // (skip hoisting/packing)
             }
           }
-          // Build A_pack at the IP (possibly hoisted)
-          auto aPackOr = buildAPackAt(rewriter, ukernel.getLoc(), A, mr, afterA, beforeA);
-          if (failed(aPackOr)) {
-            return emitSilenceableError() << "failed to build A_pack";
-          }
-          Value aPack = aPackOr->first;
+        }
 
-          // Build B_pack right before ukernel
-          OpBuilder::InsertionGuard g(rewriter);
-          rewriter.setInsertionPoint(ukernel);
-          auto bPackOr = buildBPackAt(rewriter, ukernel.getLoc(), B, nr); // seu helper B
-          if (failed(bPackOr)) {
-            return emitSilenceableError() << "failed to build B_pack";
-          }
-          Value bPack = bPackOr->first;
-
-          // If both packs exist, rewrite the ukernel to consume them.
-          if (aPack && bPack) {
-            auto newUkernelOr =
-                rewriteUkernelToUsePackedAB(rewriter, ukernel, aPack, bPack);
-            // Update localResults[0] with ukernel
-            if (succeeded(newUkernelOr)) {
-              linalg::GenericOp newUkernel = *newUkernelOr;
-              newUkernel->setAttrs({{"microkernel", rewriter.getUnitAttr()}});
-              if (!localResults.empty())
-                localResults[0] = newUkernel.getOperation();
+        // Try to hoist: move A's slice above the inner loop if invariant
+        Operation *afterA = nullptr;
+        Operation *beforeA = ukernel.getOperation();
+        // Get the innermost enclosing For
+        if (auto innerFor = dyn_cast<scf::ForOp>(localResults[5])) {
+          // Find the slice that produces A
+          if (auto aSlice = getSliceProducerOrNull(A)) {
+            if (isExtractSliceInvariantToLoop(aSlice, innerFor)) {
+              // Move the slice that feeds A outside the inner loop.
+              aSlice->moveBefore(innerFor);
+              afterA = aSlice.getOperation(); // Insert A_pack right after this slice
             }
+          }
+        }
+
+        // Build A_pack from the local slices A
+        auto loc = ukernel.getLoc();
+        auto aPackOr = buildAPackAt(rewriter, loc, A, mr, afterA, beforeA);
+        if (failed(aPackOr))
+          return emitSilenceableError() << "A_pack failed.\n";
+        Value A_pack = aPackOr->first;
+
+        // Build B_pack from the local slices B
+        OpBuilder::InsertionGuard g(rewriter);
+        rewriter.setInsertionPoint(ukernel);
+        auto bPackOr = buildBPackAt(rewriter, loc, B, nr);
+        if (failed(bPackOr))
+          return emitSilenceableError() << "B_pack failed.\n";
+        Value B_pack = bPackOr->first;
+
+        // If both packs exist, rewrite the ukernel to consume them.
+        if (A_pack && B_pack) {
+          auto newUkernelOr =
+              rewriteUkernelToUsePackedAB(rewriter, ukernel, A_pack, B_pack);
+          // Update localResults[0] with ukernel
+          if (succeeded(newUkernelOr)) {
+            linalg::GenericOp newUkernel = *newUkernelOr;
+            newUkernel->setAttrs({{"microkernel", rewriter.getUnitAttr()}});
+            if (!localResults.empty())
+              localResults[0] = newUkernel.getOperation();
           }
         }
       }
@@ -627,8 +683,8 @@ transform::SGemmOp::apply(transform::TransformRewriter &rewriter,
         if (localResults[i]) loopSet.push_back(localResults[i]);
       tempResultLoops.push_back(loopSet);
 
-    }
-  } // For targetOps
+    } // if matmulOp
+  } // for targetOps
 
   // Flatten tempResultLoops
   SmallVector<Operation*> flatResultLoops;
@@ -652,7 +708,7 @@ transform::SGemmOp::apply(transform::TransformRewriter &rewriter,
 
   return DiagnosedSilenceableFailure::success();
 
-}
+} // SGemmOp::apply
 
 void transform::SGemmOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
   consumesHandle(getTargetMutable(), effects);
