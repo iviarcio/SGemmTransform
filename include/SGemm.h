@@ -186,6 +186,15 @@ struct GemmTileSizes {
   int64_t mr = 0, nr = 0;
 };
 
+enum class PadNeed { None, Needed, Maybe };
+
+struct MaybePaddedABC {
+  Value A, B, C;
+  bool didPadA = false;
+  bool didPadB = false;
+  bool didPadC = false;
+};
+
 struct PackedAB {
   Value aPack;
   Value bPack;

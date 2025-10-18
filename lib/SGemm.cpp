@@ -79,6 +79,239 @@ void SGemm::init() {
       >();
 }
 
+// ====--------------------------------------------------------------------------
+// Utilities for zero constants, arithmetic on index values, and padding tensors.
+// ====--------------------------------------------------------------------------
+
+/// Create a zero constant compatible with `elemTy`.
+/// Supports float, integer, and index element types.
+/// Falls back to bitcast from i32 when needed.
+static Value buildZeroLike(OpBuilder &b, Location loc, Type elemTy) {
+  if (isa<FloatType>(elemTy))
+    return b.create<arith::ConstantOp>(loc, b.getFloatAttr(elemTy, 0.0));
+
+  if (auto it = dyn_cast<IntegerType>(elemTy))
+    return b.create<arith::ConstantOp>(loc, b.getIntegerAttr(elemTy, 0));
+
+  if (isa<IndexType>(elemTy))
+    return b.create<arith::ConstantIndexOp>(loc, 0);
+
+  // Fallback: materialize i32 0 and bitcast to the requested element type.
+  auto i32Zero = b.create<arith::ConstantOp>(loc, b.getI32IntegerAttr(0));
+  return b.create<arith::BitcastOp>(loc, elemTy, i32Zero);
+}
+
+/// Compute ceilDiv(x, m) for index-typed `x` and constant `m > 0`.
+/// This is safe for dynamic shapes because it uses index ops.
+static Value buildCeilDiv(OpBuilder &b, Location loc, Value x, int64_t m) {
+  assert(m > 0 && "ceilDiv divisor must be positive");
+  Value mC = b.create<arith::ConstantIndexOp>(loc, m);
+  Value oneLess = b.create<arith::ConstantIndexOp>(loc, m - 1);
+  Value num = b.create<arith::AddIOp>(loc, x, oneLess);
+  return b.create<arith::DivUIOp>(loc, num, mC);
+}
+
+/// Multiply index-typed `a` by a positive constant `cst`.
+static Value buildMul(OpBuilder &b, Location loc, Value a, int64_t cst) {
+  assert(cst >= 0 && "mul constant must be non-negative");
+  return b.create<arith::MulIOp>(loc, a, b.create<arith::ConstantIndexOp>(loc, cst));
+}
+
+/// Get `tensor.dim` as index value for ranked tensors.
+static Value dimAsIndex(OpBuilder &b, Location loc, Value tensor, int64_t d) {
+  return b.create<tensor::DimOp>(loc, tensor, d);
+}
+
+/// Pad `tensor` so that selected dimensions become multiples of the given `multiples`.
+/// - `dimsToPad`: dimensions to be padded (e.g., {0, 1}).
+/// - `multiples`: target multiples per dimension (e.g., {MR, KC}).
+/// The function generates `tensor.pad` with low=0 and computed high padding, yielding
+/// zero in the padding region. Returns the padded tensor value on success.
+static FailureOr<Value> padToMultiples(RewriterBase &rewriter, Location loc,
+                                       Value tensor,
+                                       ArrayRef<int64_t> dimsToPad,
+                                       ArrayRef<int64_t> multiples) {
+
+  auto rtt = dyn_cast<RankedTensorType>(tensor.getType());
+  if (!rtt || dimsToPad.size() != multiples.size())
+    return failure();
+
+  // Prepare low and high paddings for all dimensions.
+  SmallVector<Value> lowPads(rtt.getRank());
+  SmallVector<Value> highPads(rtt.getRank());
+  for (int64_t d = 0, rank = rtt.getRank(); d < rank; ++d) {
+    // Low padding is always 0 for our use case.
+    lowPads[d] = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+
+    // Determine if this dimension must be padded to a multiple.
+    int64_t listIdx = -1;
+    for (int64_t i = 0; i < static_cast<int64_t>(dimsToPad.size()); ++i)
+      if (dimsToPad[i] == d) { listIdx = i; break; }
+
+    if (listIdx < 0) {
+      // No padding on this dimension.
+      highPads[d] = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+      continue;
+    }
+
+    // Compute high pad: target = ceilDiv(dim, multiple) * multiple; high = target - dim.
+    const int64_t mult = multiples[listIdx];
+    Value dimV = dimAsIndex(rewriter, loc, tensor, d);
+    Value ceilDV = buildCeilDiv(rewriter, loc, dimV, mult);
+    Value target = buildMul(rewriter, loc, ceilDV, mult);
+    highPads[d] = rewriter.create<arith::SubIOp>(loc, target, dimV);
+  }
+
+  // Before creating tensor::PadOp, fast-path when no padding will be added.
+  // If all computed high pads are constant 0, return the original tensor.
+  bool allConstZero = true;
+  for (Value v : highPads) {
+    if (auto c = dyn_cast_or_null<arith::ConstantIndexOp>(v.getDefiningOp())) {
+      if (c.value() != 0) { allConstZero = false; break; }
+    } else {
+      // Dynamic expression: we cannot guarantee zero at compile-time.
+      allConstZero = false; break;
+    }
+  }
+  if (allConstZero) return tensor; // no-op: already multiple-aligned
+
+  // Build the pad op with dynamic low/high (0 or computed) and a region that
+  // yields the padding value (zero). The pad region must have `rank` index args.
+  auto elemTy = rtt.getElementType();
+  auto padOp = rewriter.create<tensor::PadOp>(
+      loc,
+      /*resultType=*/Type(),
+      tensor,
+      /*low=*/lowPads,
+      /*high=*/highPads,
+      /*nofold=*/false /* allow canonicalizations when safe */);
+
+  {
+    OpBuilder::InsertionGuard guard(rewriter);
+
+    // Create the pad region block and add `rank` index block arguments.
+    Block *body = rewriter.createBlock(&padOp.getRegion());
+    int64_t rank = rtt.getRank();
+    for (int64_t d = 0; d < rank; ++d)
+      body->addArgument(rewriter.getIndexType(), loc);
+
+    // Yield zero as the padding value.
+    Value zero = buildZeroLike(rewriter, loc, elemTy);
+    rewriter.create<tensor::YieldOp>(loc, zero);
+  }
+
+  return padOp.getResult();
+
+}
+
+// Return whether a ranked tensor type needs padding to become multiples of `multiples`.
+// - None:   all static dims are already multiples -> no padding needed
+// - Needed: at least one static dim is not a multiple -> padding definitely needed
+// - Maybe:  some dims are dynamic -> may need runtime padding, keep the path enabled
+static PadNeed needsPaddingToMultiples(RankedTensorType rtt,
+                                       ArrayRef<int64_t> multiples) {
+
+  assert(rtt && "expected ranked tensor type");
+  assert(static_cast<size_t>(rtt.getRank()) == multiples.size() &&
+         "rank/multiples size mismatch");
+  bool sawDynamic = false;
+  for (int64_t d = 0; d < rtt.getRank(); ++d) {
+    int64_t sz = rtt.getDimSize(d);
+    int64_t m  = multiples[d];
+    if (ShapedType::isDynamic(sz)) {
+      sawDynamic = true;
+      continue;
+    }
+    if (m > 1 && (sz % m) != 0) return PadNeed::Needed;
+  }
+  return sawDynamic ? PadNeed::Maybe : PadNeed::None;
+}
+
+
+/// Extract A/B/C from a linalg.generic that models Matmul (A@0, B@1, C init@0),
+/// set a safe insertion point, and invoke padToMultiples on each tensor.
+/// IMPORTANT: At this stage we do not replace the operands of the generic yet.
+/// We only compute and return the padded tensors so the caller can later decide
+/// how to rewire the IR (e.g., cloning the op or stitching slices).
+static FailureOr<MaybePaddedABC>
+preparePaddingForGemmLike(RewriterBase &rewriter,
+                          linalg::GenericOp gemmLike,
+                          const GemmTileSizes &ts) {
+
+  if (!gemmLike) return failure();
+  Location loc = gemmLike.getLoc();
+
+  // Expect (A,B) as DPS inputs and (C) as the sole init.
+  if (gemmLike.getNumDpsInputs() < 2 || gemmLike.getNumDpsInits() < 1)
+    return failure();
+
+  Value A = gemmLike.getDpsInputs()[0]; // [M,K]
+  Value B = gemmLike.getDpsInputs()[1]; // [K,N]
+  Value C = gemmLike.getDpsInits()[0];  // [M,N]
+
+  // If all three are statically-known multiples, bail out early.
+  auto rttA = dyn_cast<RankedTensorType>(A.getType());
+  auto rttB = dyn_cast<RankedTensorType>(B.getType());
+  auto rttC = dyn_cast<RankedTensorType>(C.getType());
+  if (!rttA || !rttB || !rttC) return failure(); // expect ranked tensors
+
+  PadNeed needA = needsPaddingToMultiples(rttA, {ts.mr, ts.Kc});
+  PadNeed needB = needsPaddingToMultiples(rttB, {ts.Kc, ts.nr});
+  PadNeed needC = needsPaddingToMultiples(rttC, {ts.mr, ts.nr});
+
+  if (needA == PadNeed::None && needB == PadNeed::None && needC == PadNeed::None) {
+    // Nothing to do: keep the IR pristine (no prelude ops).
+    return MaybePaddedABC{A, B, C, /*didPadA=*/false, /*didPadB=*/false, /*didPadC=*/false};
+  }
+
+  // From here on we may create pad ops (Needed/Maybe).
+  // Choose an insertion point right before the gemmLike.
+  OpBuilder::InsertionGuard g(rewriter);
+  rewriter.setInsertionPoint(gemmLike);
+
+  MaybePaddedABC out{A, B, C, false, false, false};
+
+  if (needA != PadNeed::None) {
+    // Pad A on (M,K) to multiples of (mr, Kc)
+    if (succeeded(padToMultiples(rewriter, loc, A,
+                                 /*dimsToPad=*/ArrayRef<int64_t>{0, 1},
+                                 /*multiples=*/ArrayRef<int64_t>{ts.mr, ts.Kc}))) {
+      auto aPad = *padToMultiples(rewriter, loc, A,
+                                  ArrayRef<int64_t>{0, 1},
+                                  ArrayRef<int64_t>{ts.mr, ts.Kc});
+      out.A = aPad;
+      out.didPadA = true;
+    }
+  }
+
+  if (needB != PadNeed::None) {
+    // Pad B on (K,N) to multiples of (Kc, nr)
+    if (succeeded(padToMultiples(rewriter, loc, B,
+                                 /*dimsToPad=*/ArrayRef<int64_t>{0, 1},
+                                 /*multiples=*/ArrayRef<int64_t>{ts.Kc, ts.nr}))) {
+      auto bPad = *padToMultiples(rewriter, loc, B,
+                                  ArrayRef<int64_t>{0, 1},
+                                  ArrayRef<int64_t>{ts.Kc, ts.nr});
+      out.B = bPad;
+      out.didPadB = true;
+    }
+  }
+
+  if (needC != PadNeed::None) {
+    // Pad C on (M,N) to multiples of (mr, nr)
+    if (succeeded(padToMultiples(rewriter, loc, C,
+                                 /*dimsToPad=*/ArrayRef<int64_t>{0, 1},
+                                 /*multiples=*/ArrayRef<int64_t>{ts.mr, ts.nr}))) {
+      auto cPad = *padToMultiples(rewriter, loc, C,
+                                  ArrayRef<int64_t>{0, 1},
+                                  ArrayRef<int64_t>{ts.mr, ts.nr});
+      out.C = cPad;
+      out.didPadC = true;
+    }
+  }
+  return out;
+}
+
 //===----------------------------------------------------------------------===//
 // Packing helpers (row-panel for A, col-panel for B)
 //===----------------------------------------------------------------------===//
@@ -294,6 +527,66 @@ rewriteUkernelToUsePackedAB(RewriterBase &rewriter, linalg::GenericOp ukernel,
   // Replace and erase old ukernel.
   rewriter.replaceOp(ukernel, newUkernel->getResults());
   return newUkernel;
+}
+
+/// Factor the code that, given a tiled ukernel, builds A_pack/B_pack at the
+/// right insertion points and rewrites the ukernel to consume the packed
+/// operands. Updates localResults[0] with the new ukernel.
+/// Returns success if packing+rewrite was applied.
+static LogicalResult packAndRetargetUkernel(RewriterBase &rewriter,
+                                            linalg::GenericOp ukernel,
+                                            const mKInfo &mK,
+                                            SmallVector<Operation*, 6> &localResults) {
+
+  if (!ukernel) return failure();
+  Location loc = ukernel.getLoc();
+  int64_t mr = mK.nrows;
+  int64_t nr = mK.ncols;
+
+  // Grab original A/B from the ukernel
+  Value A = ukernel.getDpsInputs()[0];
+  Value B = ukernel.getDpsInputs()[1];
+
+  // Try to hoist A's slice outside the innermost N-loop and decide IPs.
+  Operation *afterA = nullptr;
+  Operation *beforeA = ukernel.getOperation();
+
+  // Expect localResults[5] to be the innermost scf.for (as produced by tiling).
+  if (localResults.size() > 5) {
+    if (auto innerFor = dyn_cast_or_null<scf::ForOp>(localResults[5])) {
+      if (auto aSlice = getSliceProducerOrNull(A)) {
+        if (isExtractSliceInvariantToLoop(aSlice, innerFor)) {
+          // Move the slice that feeds A outside the inner loop.
+          aSlice->moveBefore(innerFor);
+          // Insert A_pack right AFTER this slice
+          afterA = aSlice.getOperation();
+        }
+      }
+    }
+  }
+
+  // Build A_pack at the chosen insertion point
+  auto aPackOr = buildAPackAt(rewriter, loc, A, mr, afterA, beforeA);
+  if (failed(aPackOr)) return failure();
+  Value aPack = aPackOr->first;
+
+  // Build B_pack right before ukernel
+  OpBuilder::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPoint(ukernel);
+  auto bPackOr = buildBPackAt(rewriter, loc, B, nr);
+  if (failed(bPackOr)) return failure();
+  Value bPack = bPackOr->first;
+
+  // Rewrite ukernel to read from packed A/B and keep C intact
+  auto newUkernelOr = rewriteUkernelToUsePackedAB(rewriter, ukernel, aPack, bPack);
+  if (failed(newUkernelOr)) return failure();
+
+  linalg::GenericOp newUkernel = *newUkernelOr;
+  newUkernel->setAttrs({{"microkernel", rewriter.getUnitAttr()}});
+  if (!localResults.empty())
+    localResults[0] = newUkernel.getOperation();
+
+  return success();
 }
 
 //===----------------------------------------------------------------------===//
@@ -555,65 +848,30 @@ transform::SGemmOp::apply(transform::TransformRewriter &rewriter,
       if (failed(res))
         return emitSilenceableError() << "failed to generalize linalg.matmul";
 
+      linalg::GenericOp genericOp = *res;
+      // Compute tile sizes once (we need them for padding multiples).
+      GemmTileSizes ts = computeGemmTiles(mK, arch);
+
+      // Padding scaffolding: extract A/B/C, set IP, and build tensor.pad if needed.
+      auto mpOr = preparePaddingForGemmLike(rewriter, genericOp, ts);
+      if (failed(mpOr)) {
+        // Non-fatal: just proceed without padding for now.
+      } else {
+        const MaybePaddedABC &mp = *mpOr;
+        (void)mp; // TODO: Wire padded A/B/C by cloning the op and slicing-back C.
+      }
+
       SmallVector<Operation*, 6> localResults;
 
-      linalg::GenericOp genericOp = *res;
+      // linalg::GenericOp genericOp = *res;
       if (failed(applyTileToGemm(rewriter, getOperation(), genericOp.getOperation(), mK, arch, localResults)))
         return emitSilenceableError() << "Failed to apply tiling.";
 
-      // First result in localResults contain the tiled uKernel (guard against missing/nullable)
+      // First result in localResults contains the tiled uKernel
       if (!localResults.empty() && localResults[0]) {
-        auto ukernel = dyn_cast<linalg::GenericOp>(localResults[0]);
-        if (ukernel) {
-          int64_t mr = mK.nrows;
-          int64_t nr = mK.ncols;
-
-          Value A = ukernel.getDpsInputs()[0];
-          Value B = ukernel.getDpsInputs()[1];
-
-          // Try to hoist A's slice outside the innermost N-loop
-          // Select the valid IPs to aPack (A may be hoisted).
-          Operation *afterA = nullptr;
-          Operation *beforeA = ukernel.getOperation();
-          // Get the innermost enclosing For
-          if (auto innerFor = dyn_cast<scf::ForOp>(localResults[5])) {
-            // Find the slice that produces A
-            if (auto aSlice = getSliceProducerOrNull(A)) {
-              if (isExtractSliceInvariantToLoop(aSlice, innerFor)) {
-                // Move the slice that feeds A outside the inner loop.
-                aSlice->moveBefore(innerFor);
-                afterA = aSlice.getOperation(); // we'll insert A_pack right AFTER this slice
-              }
-            }
-          }
-          // Build A_pack at the IP (possibly hoisted)
-          auto aPackOr = buildAPackAt(rewriter, ukernel.getLoc(), A, mr, afterA, beforeA);
-          if (failed(aPackOr)) {
-            return emitSilenceableError() << "failed to build A_pack";
-          }
-          Value aPack = aPackOr->first;
-
-          // Build B_pack right before ukernel
-          OpBuilder::InsertionGuard g(rewriter);
-          rewriter.setInsertionPoint(ukernel);
-          auto bPackOr = buildBPackAt(rewriter, ukernel.getLoc(), B, nr); // seu helper B
-          if (failed(bPackOr)) {
-            return emitSilenceableError() << "failed to build B_pack";
-          }
-          Value bPack = bPackOr->first;
-
-          // If both packs exist, rewrite the ukernel to consume them.
-          if (aPack && bPack) {
-            auto newUkernelOr =
-                rewriteUkernelToUsePackedAB(rewriter, ukernel, aPack, bPack);
-            // Update localResults[0] with ukernel
-            if (succeeded(newUkernelOr)) {
-              linalg::GenericOp newUkernel = *newUkernelOr;
-              newUkernel->setAttrs({{"microkernel", rewriter.getUnitAttr()}});
-              if (!localResults.empty())
-                localResults[0] = newUkernel.getOperation();
-            }
-          }
+        if (auto ukernel = dyn_cast<linalg::GenericOp>(localResults[0])) {
+          if (failed(packAndRetargetUkernel(rewriter, ukernel, mK, localResults)))
+            return emitSilenceableError() << "Failed to pack+retarget microkernel.";
         }
       }
 
