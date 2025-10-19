@@ -175,12 +175,25 @@ static FailureOr<Value> padToMultiples(RewriterBase &rewriter, Location loc,
   }
   if (allConstZero) return tensor; // no-op: already multiple-aligned
 
-  // Build the pad op with dynamic low/high (0 or computed) and a region that
-  // yields the padding value (zero). The pad region must have `rank` index args.
-  auto elemTy = rtt.getElementType();
+  // Compute result type (keeps shapes static when inputs/multiples are static).
+  SmallVector<int64_t> outShape(rtt.getShape().begin(), rtt.getShape().end());
+  for (auto it : llvm::enumerate(dimsToPad)) {
+    int64_t d = it.value();
+    int64_t mult = multiples[it.index()];
+    int64_t sz = rtt.getDimSize(d);
+    if (!ShapedType::isDynamic(sz)) {
+      int64_t blocks = (sz + mult - 1) / mult;
+      outShape[d] = blocks * mult;         // <- static padded size
+    } else {
+      outShape[d] = ShapedType::kDynamic;  // keep dynamic only if truly dynamic
+    }
+  }
+  auto staticRT = RankedTensorType::get(outShape, rtt.getElementType());
+
+  // Build the pad op with an explicit (preferably static) result type.
   auto padOp = rewriter.create<tensor::PadOp>(
       loc,
-      /*resultType=*/Type(),
+      /*resultType=*/staticRT,
       tensor,
       /*low=*/lowPads,
       /*high=*/highPads,
@@ -196,7 +209,7 @@ static FailureOr<Value> padToMultiples(RewriterBase &rewriter, Location loc,
       body->addArgument(rewriter.getIndexType(), loc);
 
     // Yield zero as the padding value.
-    Value zero = buildZeroLike(rewriter, loc, elemTy);
+    Value zero = buildZeroLike(rewriter, loc, rtt.getElementType());
     rewriter.create<tensor::YieldOp>(loc, zero);
   }
 
@@ -273,12 +286,11 @@ preparePaddingForGemmLike(RewriterBase &rewriter,
 
   if (needA != PadNeed::None) {
     // Pad A on (M,K) to multiples of (mr, Kc)
-    if (succeeded(padToMultiples(rewriter, loc, A,
+    auto aPadOr = padToMultiples(rewriter, loc, A,
                                  /*dimsToPad=*/ArrayRef<int64_t>{0, 1},
-                                 /*multiples=*/ArrayRef<int64_t>{ts.mr, ts.Kc}))) {
-      auto aPad = *padToMultiples(rewriter, loc, A,
-                                  ArrayRef<int64_t>{0, 1},
-                                  ArrayRef<int64_t>{ts.mr, ts.Kc});
+                                 /*multiples=*/ArrayRef<int64_t>{ts.mr, ts.Kc});
+    if (mlir::succeeded(aPadOr)) {
+      Value aPad = *aPadOr;
       out.A = aPad;
       out.didPadA = true;
     }
@@ -286,12 +298,11 @@ preparePaddingForGemmLike(RewriterBase &rewriter,
 
   if (needB != PadNeed::None) {
     // Pad B on (K,N) to multiples of (Kc, nr)
-    if (succeeded(padToMultiples(rewriter, loc, B,
-                                 /*dimsToPad=*/ArrayRef<int64_t>{0, 1},
-                                 /*multiples=*/ArrayRef<int64_t>{ts.Kc, ts.nr}))) {
-      auto bPad = *padToMultiples(rewriter, loc, B,
-                                  ArrayRef<int64_t>{0, 1},
-                                  ArrayRef<int64_t>{ts.Kc, ts.nr});
+    auto bPadOr = padToMultiples(rewriter, loc, B,
+                                /*dimsToPad=*/ArrayRef<int64_t>{0, 1},
+                                /*multiples=*/ArrayRef<int64_t>{ts.mr, ts.Kc});
+    if (mlir::succeeded(bPadOr)) {
+      Value bPad = *bPadOr;
       out.B = bPad;
       out.didPadB = true;
     }
@@ -299,12 +310,11 @@ preparePaddingForGemmLike(RewriterBase &rewriter,
 
   if (needC != PadNeed::None) {
     // Pad C on (M,N) to multiples of (mr, nr)
-    if (succeeded(padToMultiples(rewriter, loc, C,
-                                 /*dimsToPad=*/ArrayRef<int64_t>{0, 1},
-                                 /*multiples=*/ArrayRef<int64_t>{ts.mr, ts.nr}))) {
-      auto cPad = *padToMultiples(rewriter, loc, C,
-                                  ArrayRef<int64_t>{0, 1},
-                                  ArrayRef<int64_t>{ts.mr, ts.nr});
+    auto cPadOr = padToMultiples(rewriter, loc, C,
+                                /*dimsToPad=*/ArrayRef<int64_t>{0, 1},
+                                /*multiples=*/ArrayRef<int64_t>{ts.mr, ts.Kc});
+    if (mlir::succeeded(cPadOr)) {
+      auto cPad = *cPadOr;
       out.C = cPad;
       out.didPadC = true;
     }
@@ -354,8 +364,14 @@ static RankedTensorType
 computeAPackedType(RankedTensorType aType, int64_t mr) {
   auto shape = aType.getShape();
   int64_t Mc = shape[0], Kc = shape[1];
-  assert(Mc % mr == 0 && "Mc must be a multiple of mr for simple packing");
-  SmallVector<int64_t, 3> newShape = {Mc / mr, Kc, mr};
+  if (!ShapedType::isDynamic(Mc))
+    assert(Mc % mr == 0 && "Mc must be a multiple of mr for simple packing");
+
+  auto divOrDyn = [&](int64_t d, int64_t c) {
+    return ShapedType::isDynamic(d) ? ShapedType::kDynamic : (d / c);
+  };
+
+  SmallVector<int64_t, 3> newShape = {divOrDyn(Mc, mr), Kc, mr};
   return RankedTensorType::get(newShape, aType.getElementType());
 }
 
@@ -364,8 +380,14 @@ static RankedTensorType
 computeBPackedType(RankedTensorType bType, int64_t nr) {
   auto shape = bType.getShape();
   int64_t Kc = shape[0], Nc = shape[1];
-  assert(Nc % nr == 0 && "Nc must be a multiple of nr for simple packing");
-  SmallVector<int64_t, 3> newShape = {Kc, Nc / nr, nr};
+  if (!ShapedType::isDynamic(Nc))
+    assert(Nc % nr == 0 && "Nc must be a multiple of nr for simple packing");
+
+  auto divOrDyn = [&](int64_t d, int64_t c) {
+    return ShapedType::isDynamic(d) ? ShapedType::kDynamic : (d / c);
+  };
+
+  SmallVector<int64_t, 3> newShape = {Kc, divOrDyn(Nc, nr), nr};
   return RankedTensorType::get(newShape, bType.getElementType());
 }
 
@@ -503,29 +525,67 @@ rewriteUkernelToUsePackedAB(RewriterBase &rewriter, linalg::GenericOp ukernel,
   AffineMap cMap     = AffineMap::get(/*dims=*/3, /*symbols=*/0,
                                       ArrayRef<AffineExpr>{i, j}, ctx);
 
+  // micro-tile is fixed as (mr x nr); if `oldC` is a slice, we insert back.
+  auto cSh = cast<ShapedType>(oldC.getType());
+  Type elemTy = cSh.getElementType();
+  int64_t mrStatic = aPackTy.getShape().back();   // last dim of A_pack is mr
+  int64_t nrStatic = bPackTy.getShape().back();   // last dim of B_pack is nr
+  auto ukOutTy = RankedTensorType::get({mrStatic, nrStatic}, elemTy);
+
+  // Create a static empty for the micro-tile result.
+  Value ukEmpty = rewriter.create<tensor::EmptyOp>(loc, ukOutTy.getShape(), ukOutTy.getElementType());
+
   // Create the iterator types
   auto parallel = utils::IteratorType::parallel;
   auto reduction = utils::IteratorType::reduction;
   SmallVector<utils::IteratorType> iters = {parallel, reduction, parallel};
 
-  // Clone as a new generic that reads from A_pack/B_pack.
+  // New ukernel writes into (mr x nr) static tile.
   rewriter.setInsertionPoint(ukernel);
   auto newUkernel = rewriter.create<linalg::GenericOp>(
       loc,
-      /*resultTensorTypes=*/TypeRange{oldC.getType()},
+      /*resultTensorTypes=*/TypeRange{ukOutTy},
       /*inputs=*/ValueRange{aPack, bPack},
-      /*outputs=*/ValueRange{oldC},
+      /*outputs=*/ValueRange{ukEmpty},
       /*indexingMaps=*/ArrayRef<AffineMap>{aPackMap, bPackMap, cMap},
       /*iteratorTypes=*/iters,
       [&](OpBuilder &b, Location nloc, ValueRange args) {
-        // args: Aelt, Belt, Celt
         Value mul = createMul(nloc, args[0], args[1], b);
         Value sum = createAdd(nloc, mul, args[2], b);
         b.create<linalg::YieldOp>(nloc, sum);
       });
 
-  // Replace and erase old ukernel.
-  rewriter.replaceOp(ukernel, newUkernel->getResults());
+  // If oldC is a slice of a bigger tensor, insert the (mr x nr) result back.
+  Value finalOut = newUkernel.getResult(0);
+
+  // Helper: try to view `oldC` as a tensor.extract_slice
+  auto tryGetExtractSlice = [](Value v) -> tensor::ExtractSliceOp {
+    if (auto defOp = v.getDefiningOp()) {
+      if (auto ex = dyn_cast<tensor::ExtractSliceOp>(defOp))
+        return ex;
+    }
+    return nullptr;
+  };
+
+  if (auto cSlice = tryGetExtractSlice(oldC)) {
+    SmallVector<OpFoldResult> offs  = cSlice.getMixedOffsets();
+    SmallVector<OpFoldResult> sizes = cSlice.getMixedSizes();
+    SmallVector<OpFoldResult> strs  = cSlice.getMixedStrides();
+
+    // Build insert_slice: src is (mr x nr), dest is the original larger tensor.
+    finalOut = rewriter.create<tensor::InsertSliceOp>(
+        loc,
+        /*source=*/newUkernel.getResult(0),
+        /*dest=*/cSlice.getSource(),
+        offs, sizes, strs);
+
+    // drop the old extract if it is now dead via replace later.
+  } else {
+    // Fallback: oldC is not a slice. Keep the ukernel result as is.
+  }
+
+  // Replace ukernel with either the static tile (mr x nr) or the inserted big tensor.
+  rewriter.replaceOp(ukernel, ValueRange{finalOut});
   return newUkernel;
 }
 
@@ -858,7 +918,31 @@ transform::SGemmOp::apply(transform::TransformRewriter &rewriter,
         // Non-fatal: just proceed without padding for now.
       } else {
         const MaybePaddedABC &mp = *mpOr;
-        (void)mp; // TODO: Wire padded A/B/C by cloning the op and slicing-back C.
+
+        // Rewire the GEMM to use padded A/B/C by cloning a new generic just before tiling.
+        {
+          OpBuilder::InsertionGuard guard(rewriter);
+          rewriter.setInsertionPoint(genericOp);
+          SmallVector<AffineMap> maps = llvm::to_vector(genericOp.getIndexingMapsArray());
+          SmallVector<utils::IteratorType> iters = llvm::to_vector(genericOp.getIteratorTypesArray());
+
+          Type outTy = mp.C.getType();
+          auto cloned = rewriter.create<linalg::GenericOp>(
+              genericOp.getLoc(),
+              /*resultTensorTypes=*/TypeRange{outTy},
+              /*inputs=*/ValueRange{mp.A, mp.B},
+              /*outputs=*/ValueRange{mp.C},
+              /*indexingMaps=*/maps,
+              /*iteratorTypes=*/iters,
+              [&](OpBuilder &b, Location loc, ValueRange args) {
+                // args = {Aelt, Belt, Celt}
+                Value mul = createMul(loc, args[0], args[1], b);
+                Value sum = createAdd(loc, mul, args[2], b);
+                b.create<linalg::YieldOp>(loc, sum);
+              });
+          rewriter.replaceOp(genericOp, cloned->getResults());
+          genericOp = cloned;
+        }
       }
 
       SmallVector<Operation*, 6> localResults;
