@@ -297,10 +297,11 @@ preparePaddingForGemmLike(RewriterBase &rewriter,
   }
 
   if (needB != PadNeed::None) {
-    // Pad B on (K,N) to multiples of (Kc, nr)
+    // Pad B on (K, N) to multiples of (Kc, nr).
+    // Rationale: the reduction dimension must align to Kc; output columns align to nr.
     auto bPadOr = padToMultiples(rewriter, loc, B,
-                                /*dimsToPad=*/ArrayRef<int64_t>{0, 1},
-                                /*multiples=*/ArrayRef<int64_t>{ts.mr, ts.Kc});
+                                 /*dimsToPad=*/ArrayRef<int64_t>{0, 1},
+                                 /*multiples=*/ArrayRef<int64_t>{ts.Kc, ts.nr});
     if (mlir::succeeded(bPadOr)) {
       Value bPad = *bPadOr;
       out.B = bPad;
@@ -309,16 +310,18 @@ preparePaddingForGemmLike(RewriterBase &rewriter,
   }
 
   if (needC != PadNeed::None) {
-    // Pad C on (M,N) to multiples of (mr, nr)
+    // Pad C on (M, N) to multiples of (mr, nr).
+    // Rationale: the output micro-tile is mr x nr, keep tails aligned to the micro-kernel.
     auto cPadOr = padToMultiples(rewriter, loc, C,
-                                /*dimsToPad=*/ArrayRef<int64_t>{0, 1},
-                                /*multiples=*/ArrayRef<int64_t>{ts.mr, ts.Kc});
+                                 /*dimsToPad=*/ArrayRef<int64_t>{0, 1},
+                                 /*multiples=*/ArrayRef<int64_t>{ts.mr, ts.nr});
     if (mlir::succeeded(cPadOr)) {
       auto cPad = *cPadOr;
       out.C = cPad;
       out.didPadC = true;
     }
   }
+
   return out;
 }
 
@@ -487,106 +490,112 @@ buildBPackAt(RewriterBase &rewriter, Location loc, Value B, int64_t nr) {
 static FailureOr<linalg::GenericOp>
 rewriteUkernelToUsePackedAB(RewriterBase &rewriter, linalg::GenericOp ukernel,
                             Value aPack, Value bPack) {
-  Location loc = ukernel.getLoc();
+
   MLIRContext *ctx = rewriter.getContext();
+  Location loc = ukernel.getLoc();
 
   // Old operands
   Value oldA = ukernel.getDpsInputs()[0];
   Value oldB = ukernel.getDpsInputs()[1];
   Value oldC = ukernel.getDpsInits()[0];
 
-  // Original maps (expect A(i,k), B(k,j), C(i,j))
-  SmallVector<AffineMap> maps = llvm::to_vector(ukernel.getIndexingMapsArray());
-  if (maps.size() != 3) return failure();
+  // We will keep the same iterator types and the same result tensor type as `oldC`.
+  // Only the input operands A/B are swapped to read from packed tensors via new indexing maps.
+  SmallVector<utils::IteratorType> iters =
+      llvm::to_vector(ukernel.getIteratorTypesArray());
+  auto oldMaps = ukernel.getIndexingMapsArray();
+  if (oldMaps.size() != 3)
+    return failure();
 
-  // Build new maps: replace A/B maps to point into packed layouts.
-  // We assume iterators are [i (parallel), k (reduction), j (parallel)] after outer+inner tiling.
-  // Use 3-dim domain for the ukernel body referring to (i,k,j) as before.
-  AffineExpr i, k, j;
-  bindDims(ctx, i, k, j);
+  // Determine loop role positions from iterator types:
+  // exactly one reduction (K), and two parallels (M,N) in any order.
+  int redPos = -1, par0 = -1, par1 = -1;
+  for (int p = 0; p < static_cast<int>(iters.size()); ++p) {
+    if (iters[p] == utils::IteratorType::reduction) {
+      redPos = p;
+    } else {
+      (par0 < 0) ? par0 = p : par1 = p;
+    }
+  }
+  if (redPos < 0 || par0 < 0 || par1 < 0)
+    return failure();
 
-  // A_pack is indexed by (io, k, ii) with io=floor(i/mr), ii=mod(i,mr).
-  // We don't have 'mr' here; infer from the aPack type: last dim is 'mr'.
-  auto aPackTy = cast<RankedTensorType>(aPack.getType());
-  int64_t mr = aPackTy.getShape().back();
-  AffineExpr io = i.floorDiv(mr);
-  AffineExpr ii = i % mr;
+  // Decide which parallel loop indexes rows (M) and which indexes cols (N)
+  // by inspecting the C map. We expect C's map to be rank-2 like (M,N).
+  AffineMap cOld = oldMaps[2];
+  if (cOld.getNumResults() != 2 || cOld.getNumDims() != static_cast<unsigned>(iters.size()))
+    return failure();
 
-  // B_pack is indexed by (k, jo, ji) with jo=floor(j/nr), ji=mod(j,nr).
-  auto bPackTy = cast<RankedTensorType>(bPack.getType());
-  int64_t nr = bPackTy.getShape().back();
-  AffineExpr jo = j.floorDiv(nr);
-  AffineExpr ji = j % nr;
+  // Extract which dim goes to C's first and second result component.
+  auto res0 = dyn_cast<AffineDimExpr>(cOld.getResult(0));
+  auto res1 = dyn_cast<AffineDimExpr>(cOld.getResult(1));
+  if (!res0 || !res1) return failure();
+  int c0 = res0.getPosition();
+  int c1 = res1.getPosition();
 
-  AffineMap aPackMap = AffineMap::get(/*dims=*/3, /*symbols=*/0,
-                                      ArrayRef<AffineExpr>{io, k, ii}, ctx);
-  AffineMap bPackMap = AffineMap::get(/*dims=*/3, /*symbols=*/0,
-                                      ArrayRef<AffineExpr>{k, jo, ji}, ctx);
-  AffineMap cMap     = AffineMap::get(/*dims=*/3, /*symbols=*/0,
-                                      ArrayRef<AffineExpr>{i, j}, ctx);
+  // Map those dims to "M" and "N".
+  int mPos = c0; // loop dim feeding the first C index
+  int nPos = c1; // loop dim feeding the second C index
+  if (iters[mPos] != utils::IteratorType::parallel ||
+      iters[nPos] != utils::IteratorType::parallel)
+    return failure(); // sanity: both must be parallel
 
-  // micro-tile is fixed as (mr x nr); if `oldC` is a slice, we insert back.
-  auto cSh = cast<ShapedType>(oldC.getType());
-  Type elemTy = cSh.getElementType();
-  int64_t mrStatic = aPackTy.getShape().back();   // last dim of A_pack is mr
-  int64_t nrStatic = bPackTy.getShape().back();   // last dim of B_pack is nr
-  auto ukOutTy = RankedTensorType::get({mrStatic, nrStatic}, elemTy);
+  // Query mr/nr from the packed tensor types.
+  auto aPackTy = cast<RankedTensorType>(aPack.getType()); // [..., Kc, mr]
+  auto bPackTy = cast<RankedTensorType>(bPack.getType()); // [Kc, ..., nr]
+  const int64_t mr = aPackTy.getShape().back();
+  const int64_t nr = bPackTy.getShape().back();
 
-  // Create a static empty for the micro-tile result.
-  Value ukEmpty = rewriter.create<tensor::EmptyOp>(loc, ukOutTy.getShape(), ukOutTy.getElementType());
+  // Build new indexing maps (dims = number of ukernel loops).
+  // A_pack index: ( floor(M/mr), K, M % mr )
+  // B_pack index: ( K, floor(N/nr), N % nr )
+  // C index    : ( M, N )
+  SmallVector<AffineExpr> dims;
+  dims.reserve(iters.size());
+  for (unsigned d = 0; d < iters.size(); ++d)
+    dims.push_back(getAffineDimExpr(d, ctx));
 
-  // Create the iterator types
-  auto parallel = utils::IteratorType::parallel;
-  auto reduction = utils::IteratorType::reduction;
-  SmallVector<utils::IteratorType> iters = {parallel, reduction, parallel};
+  AffineExpr M  = dims[mPos];
+  AffineExpr N  = dims[nPos];
+  AffineExpr K  = dims[redPos];
 
-  // New ukernel writes into (mr x nr) static tile.
+  AffineExpr io = M.floorDiv(mr);
+  AffineExpr ii = M % mr;
+  AffineExpr jo = N.floorDiv(nr);
+  AffineExpr ji = N % nr;
+
+  AffineMap aPackMap = AffineMap::get(/*dims=*/iters.size(), /*symbols=*/0,
+                                      ArrayRef<AffineExpr>{io, K, ii}, ctx);
+  AffineMap bPackMap = AffineMap::get(/*dims=*/iters.size(), /*symbols=*/0,
+                                      ArrayRef<AffineExpr>{K, jo, ji}, ctx);
+  AffineMap cMap     = AffineMap::get(/*dims=*/iters.size(), /*symbols=*/0,
+                                      ArrayRef<AffineExpr>{M, N}, ctx);
+
+  // The result tensor type stays exactly the same as oldC's type.
+  auto outTy = cast<RankedTensorType>(oldC.getType());
+  Value outInit = oldC;
+
+  // Materialize the remapped ukernel that consumes A_pack/B_pack and writes to the same C tile.
   rewriter.setInsertionPoint(ukernel);
-  auto newUkernel = rewriter.create<linalg::GenericOp>(
+  auto remapped = rewriter.create<linalg::GenericOp>(
       loc,
-      /*resultTensorTypes=*/TypeRange{ukOutTy},
+      /*resultTensorTypes=*/TypeRange{outTy},
       /*inputs=*/ValueRange{aPack, bPack},
-      /*outputs=*/ValueRange{ukEmpty},
+      /*outputs=*/ValueRange{outInit},
       /*indexingMaps=*/ArrayRef<AffineMap>{aPackMap, bPackMap, cMap},
       /*iteratorTypes=*/iters,
       [&](OpBuilder &b, Location nloc, ValueRange args) {
+        // args: A(M,K), B(K,N), Acc(M,N)
         Value mul = createMul(nloc, args[0], args[1], b);
         Value sum = createAdd(nloc, mul, args[2], b);
         b.create<linalg::YieldOp>(nloc, sum);
       });
 
-  // If oldC is a slice of a bigger tensor, insert the (mr x nr) result back.
-  Value finalOut = newUkernel.getResult(0);
+  // Replace the original ukernel with the remapped one.
+  rewriter.replaceOp(ukernel, remapped->getResults());
+  remapped->setAttrs({{"microkernel", rewriter.getUnitAttr()}});
+  return remapped;
 
-  // Helper: try to view `oldC` as a tensor.extract_slice
-  auto tryGetExtractSlice = [](Value v) -> tensor::ExtractSliceOp {
-    if (auto defOp = v.getDefiningOp()) {
-      if (auto ex = dyn_cast<tensor::ExtractSliceOp>(defOp))
-        return ex;
-    }
-    return nullptr;
-  };
-
-  if (auto cSlice = tryGetExtractSlice(oldC)) {
-    SmallVector<OpFoldResult> offs  = cSlice.getMixedOffsets();
-    SmallVector<OpFoldResult> sizes = cSlice.getMixedSizes();
-    SmallVector<OpFoldResult> strs  = cSlice.getMixedStrides();
-
-    // Build insert_slice: src is (mr x nr), dest is the original larger tensor.
-    finalOut = rewriter.create<tensor::InsertSliceOp>(
-        loc,
-        /*source=*/newUkernel.getResult(0),
-        /*dest=*/cSlice.getSource(),
-        offs, sizes, strs);
-
-    // drop the old extract if it is now dead via replace later.
-  } else {
-    // Fallback: oldC is not a slice. Keep the ukernel result as is.
-  }
-
-  // Replace ukernel with either the static tile (mr x nr) or the inserted big tensor.
-  rewriter.replaceOp(ukernel, ValueRange{finalOut});
-  return newUkernel;
 }
 
 /// Factor the code that, given a tiled ukernel, builds A_pack/B_pack at the
