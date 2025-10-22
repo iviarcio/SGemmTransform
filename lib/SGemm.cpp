@@ -137,11 +137,11 @@ static FailureOr<Value> padToMultiples(RewriterBase &rewriter, Location loc,
     return failure();
 
   // Prepare low and high paddings for all dimensions.
-  SmallVector<Value> lowPads(rtt.getRank());
-  SmallVector<Value> highPads(rtt.getRank());
+  SmallVector<OpFoldResult> lowPads(rtt.getRank());
+  SmallVector<OpFoldResult> highPads(rtt.getRank());
   for (int64_t d = 0, rank = rtt.getRank(); d < rank; ++d) {
     // Low padding is always 0 for our use case.
-    lowPads[d] = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    lowPads[d] = rewriter.getIndexAttr(0);
 
     // Determine if this dimension must be padded to a multiple.
     int64_t listIdx = -1;
@@ -150,30 +150,37 @@ static FailureOr<Value> padToMultiples(RewriterBase &rewriter, Location loc,
 
     if (listIdx < 0) {
       // No padding on this dimension.
-      highPads[d] = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+      highPads[d] = rewriter.create<arith::ConstantIndexOp>(loc, 0).getResult();
       continue;
     }
 
-    // Compute high pad: target = ceilDiv(dim, multiple) * multiple; high = target - dim.
+    // Compute high pad amount per dimension.
+    // target = ceilDiv(dim, multiple) * multiple; high = target - dim.
     const int64_t mult = multiples[listIdx];
-    Value dimV = dimAsIndex(rewriter, loc, tensor, d);
-    Value ceilDV = buildCeilDiv(rewriter, loc, dimV, mult);
-    Value target = buildMul(rewriter, loc, ceilDV, mult);
-    highPads[d] = rewriter.create<arith::SubIOp>(loc, target, dimV);
+    int64_t dimStatic = rtt.getDimSize(d);
+
+    if (!ShapedType::isDynamic(dimStatic)) {
+      // Fully static: compute high pad as a constant.
+      int64_t blocks = (dimStatic + mult - 1) / mult;
+      int64_t targetStatic = blocks * mult;
+      int64_t highStatic = targetStatic - dimStatic;
+      highPads[d] = rewriter.getIndexAttr(highStatic);
+    } else {
+      // Dynamic: fall back to SSA computations.
+      Value dimV = dimAsIndex(rewriter, loc, tensor, d);
+      Value ceilDV = buildCeilDiv(rewriter, loc, dimV, mult);
+      Value target = buildMul(rewriter, loc, ceilDV, mult);
+      highPads[d] = rewriter.create<arith::SubIOp>(loc, target, dimV).getResult();
+    }
   }
 
   // Before creating tensor::PadOp, fast-path when no padding will be added.
   // If all computed high pads are constant 0, return the original tensor.
-  bool allConstZero = true;
-  for (Value v : highPads) {
-    if (auto c = dyn_cast_or_null<arith::ConstantIndexOp>(v.getDefiningOp())) {
-      if (c.value() != 0) { allConstZero = false; break; }
-    } else {
-      // Dynamic expression: we cannot guarantee zero at compile-time.
-      allConstZero = false; break;
-    }
-  }
-  if (allConstZero) return tensor; // no-op: already multiple-aligned
+  bool allConstZero = llvm::all_of(highPads, [](OpFoldResult ofr) {
+    return mlir::isZeroIndex(ofr);
+  });
+  if (allConstZero)
+    return tensor; // no-op: already multiple-aligned
 
   // Compute result type (keeps shapes static when inputs/multiples are static).
   SmallVector<int64_t> outShape(rtt.getShape().begin(), rtt.getShape().end());
@@ -188,21 +195,20 @@ static FailureOr<Value> padToMultiples(RewriterBase &rewriter, Location loc,
       outShape[d] = ShapedType::kDynamic;  // keep dynamic only if truly dynamic
     }
   }
-  auto staticRT = RankedTensorType::get(outShape, rtt.getElementType());
+    auto resType = RankedTensorType::get(outShape, rtt.getElementType());
 
   // Build the pad op with an explicit (preferably static) result type.
   auto padOp = rewriter.create<tensor::PadOp>(
       loc,
-      /*resultType=*/staticRT,
+      /*resultType=*/resType,
       tensor,
       /*low=*/lowPads,
       /*high=*/highPads,
       /*nofold=*/false /* allow canonicalizations when safe */);
 
+  // Create the pad region block and add `rank` index block arguments.
   {
     OpBuilder::InsertionGuard guard(rewriter);
-
-    // Create the pad region block and add `rank` index block arguments.
     Block *body = rewriter.createBlock(&padOp.getRegion());
     int64_t rank = rtt.getRank();
     for (int64_t d = 0; d < rank; ++d)
@@ -326,6 +332,68 @@ preparePaddingForGemmLike(RewriterBase &rewriter,
 }
 
 //===----------------------------------------------------------------------===//
+// Helpers for 'tensor.empty' with dynamic dims
+//===----------------------------------------------------------------------===//
+
+/// Converts an OpFoldResult to a Value, materializing an index constant when it's an Attribute.
+static Value valueFromOFR(OpBuilder &rewriter, Location loc, OpFoldResult ofr) {
+  if (auto v = dyn_cast<Value>(ofr))
+    return v;
+  // Attribute branch: expect IntegerAttr for index.
+  auto attr = dyn_cast<Attribute>(ofr);
+  auto ia   = mlir::cast<IntegerAttr>(attr);
+  return rewriter.create<arith::ConstantIndexOp>(loc, ia.getInt());
+
+}
+
+/// Creates a tensor.empty of type `resultTy`.
+/// For every dynamic dimension ('?') in `resultTy`, the caller must supply one
+/// size Value in `dynSizesInRankOrder`, in increasing dimension order.
+static Value buildEmptyForType(OpBuilder &rewriter, Location loc,
+                               RankedTensorType resultTy,
+                               ArrayRef<Value> dynSizesInRankOrder) {
+  // Collect the static shape and the dynamic size operands in rank order.
+  SmallVector<int64_t> staticShape(resultTy.getShape().begin(),
+                                   resultTy.getShape().end());
+
+  SmallVector<Value> dynSizes;
+  dynSizes.reserve(dynSizesInRankOrder.size());
+  for (int64_t d = 0, idx = 0; d < (int64_t)staticShape.size(); ++d) {
+    if (ShapedType::isDynamic(staticShape[d])) {
+      assert(idx < (int64_t)dynSizesInRankOrder.size() &&
+             "missing dynamic size operand for dynamic dim");
+      dynSizes.push_back(dynSizesInRankOrder[idx++]);
+    }
+  }
+
+  // Build the EmptyOp using the (staticShape, elementType, dynamicSizes, encoding) order.
+  return rewriter.create<tensor::EmptyOp>(
+      loc,
+      /*staticShape=*/ArrayRef<int64_t>(staticShape),
+      /*elementType=*/resultTy.getElementType(),
+      /*dynamicSizes=*/ValueRange(dynSizes),
+      /*encoding=*/resultTy.getEncoding());
+}
+
+/// Extract one size Value for a given dimension from a tensor value.
+/// If the producer is a tensor.extract_slice, reuse its mixedSizes[i];
+/// otherwise, fall back to tensor.dim (which is fine at tile granularity).
+static Value getDimValueFor(OpBuilder &rewriter, Location loc, Value tensor, int64_t dim) {
+  if (Operation *def = tensor.getDefiningOp())
+    if (auto slice = dyn_cast<tensor::ExtractSliceOp>(def)) {
+      OpFoldResult sz = slice.getMixedSizes()[dim];
+      if (auto cst = dyn_cast<Attribute>(sz)) {
+        // Promote static integer to an index constant.
+        auto ival = cast<IntegerAttr>(cst).getInt();
+        return rewriter.create<arith::ConstantIndexOp>(loc, ival);
+      }
+      return valueFromOFR(rewriter, loc, sz);
+    }
+  // Generic fallback.
+  return rewriter.create<tensor::DimOp>(loc, tensor, dim);
+}
+
+//===----------------------------------------------------------------------===//
 // Packing helpers (row-panel for A, col-panel for B)
 //===----------------------------------------------------------------------===//
 
@@ -427,6 +495,7 @@ static void buildBPackMaps(MLIRContext *ctx, int64_t nr,
 static FailureOr<std::pair<Value, RankedTensorType>>
 buildAPackAt(RewriterBase &rewriter, Location loc, Value A, int64_t mr,
              Operation *afterOp, Operation *beforeOp) {
+
   OpBuilder::InsertionGuard g(rewriter);
 
   if (afterOp) {
@@ -437,15 +506,33 @@ buildAPackAt(RewriterBase &rewriter, Location loc, Value A, int64_t mr,
     return failure();
   }
 
+  // aType is the rank-2 tile of A: tensor<?xKc> in the tail case.
   auto aType = dyn_cast<RankedTensorType>(A.getType());
   if (!aType || aType.getRank() != 2) return failure();
 
+  // Compute the packed type: [Mc/mr, Kc, mr] with dynamic dims propagated.
   auto aPackTy = computeAPackedType(aType, mr);
   AffineMap aInMap, aOutMap;
   buildAPackMaps(rewriter.getContext(), mr, aInMap, aOutMap);
 
-  Value aEmpty = rewriter.create<tensor::EmptyOp>(
-      loc, aPackTy.getShape(), aPackTy.getElementType());
+  // Build dynamic size operands for dynamic dims of aPackTy, in rank order.
+  // aType is the tile type of A (rank-2). `A` is the tile value (extract_slice result).
+  SmallVector<Value> dynSizesForAPack;
+  if (ShapedType::isDynamic(aPackTy.getDimSize(0))) {
+    // dim 0 of A_pack is Mc/mr. Get Mc from A tile dim[0] and divide by mr.
+    Value mc   = getDimValueFor(rewriter, loc, /*aLocal=*/A, /*dim=*/0);
+    Value cMr  = rewriter.create<arith::ConstantIndexOp>(loc, mr);
+    Value mcDr = rewriter.create<arith::DivSIOp>(loc, mc, cMr);
+    dynSizesForAPack.push_back(mcDr);
+  }
+  if (ShapedType::isDynamic(aPackTy.getDimSize(1))) {
+    // dim 1 of A_pack is Kc (tile K). Reuse tile K from A tile dim[1].
+    Value kc = getDimValueFor(rewriter, loc, /*aLocal=*/A, /*dim=*/1);
+    dynSizesForAPack.push_back(kc);
+  }
+
+  // Create empty for A_pack providing dynamic sizes only for '?' dims.
+  Value aEmpty = buildEmptyForType(rewriter, loc, aPackTy, dynSizesForAPack);
 
   auto aPack = rewriter.create<linalg::GenericOp>(
       loc, TypeRange{aPackTy}, ValueRange{A}, ValueRange{aEmpty},
@@ -464,6 +551,7 @@ buildAPackAt(RewriterBase &rewriter, Location loc, Value A, int64_t mr,
 // out : B_pack type [Kc, Nc/nr, nr]
 static FailureOr<std::pair<Value, RankedTensorType>>
 buildBPackAt(RewriterBase &rewriter, Location loc, Value B, int64_t nr) {
+
   auto bType = dyn_cast<RankedTensorType>(B.getType());
   if (!bType || bType.getRank() != 2) return failure();
   auto bPackTy = computeBPackedType(bType, nr);
@@ -471,8 +559,23 @@ buildBPackAt(RewriterBase &rewriter, Location loc, Value B, int64_t nr) {
   AffineMap bInMap, bOutMap;
   buildBPackMaps(rewriter.getContext(), nr, bInMap, bOutMap);
 
-  Value bEmpty = rewriter.create<tensor::EmptyOp>(loc, bPackTy.getShape(),
-                                                  bPackTy.getElementType());
+  SmallVector<Value> dynSizesForBPack;
+  if (ShapedType::isDynamic(bPackTy.getDimSize(0))) {
+    // dim 0 of B_pack is Kc. Reuse tile K from B tile dim[0].
+    Value kc = getDimValueFor(rewriter, loc, /*bLocal=*/B, /*dim=*/0);
+    dynSizesForBPack.push_back(kc);
+  }
+  if (ShapedType::isDynamic(bPackTy.getDimSize(1))) {
+    // dim 1 of B_pack is Nc/nr. Compute Nc from B tile dim[1] and divide by nr.
+    Value nc  = getDimValueFor(rewriter, loc, /*bLocal=*/B, /*dim=*/1);
+    Value cNr = rewriter.create<arith::ConstantIndexOp>(loc, nr);
+    Value ncDr= rewriter.create<arith::DivSIOp>(loc, nc, cNr);
+    dynSizesForBPack.push_back(ncDr);
+  }
+
+  // Create empty for B_pack providing dynamic sizes only for '?' dims.
+  Value bEmpty = buildEmptyForType(rewriter, loc, bPackTy, dynSizesForBPack);
+
   auto bPack = rewriter.create<linalg::GenericOp>(
       loc, TypeRange{bPackTy}, ValueRange{B}, ValueRange{bEmpty},
       ArrayRef<AffineMap>{bInMap, bOutMap},
