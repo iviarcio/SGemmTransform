@@ -765,23 +765,28 @@ static LogicalResult packAndRetargetUkernel(RewriterBase &rewriter,
 // Tiling Helpers
 //===----------------------------------------------------------------------===//
 
-/// Returns the largest panel size kc' such that:
-///  - kc' <= kcDefault (128)
-///  - K % kc' == 0
-///  - kc' is aligned to 'alignK' (e.g., unroll factor/vlen)
-///  - kc' >= kcMin (to avoid degenerate tiny panels)
+/// Returns the largest panel size kc such that: (1) kc <= kcDefault (128);
+///  (2) K % kc == 0; & (3) kc >= kcMin (to avoid degenerate tiny panels)
+///  Note: kc is aligned to 'alignK' when unroll factor/vlen is mandatory
 /// If no candidate is found, returns kcDefault.
 static int64_t chooseAdaptiveKc(int64_t K, int64_t kcDefault,
                                 int64_t kcMin = 64, int64_t alignK = 8) {
+
   if (ShapedType::isDynamic(K)) return kcDefault; // cannot decide statically
-  // First try the default if it already divides K and is aligned.
-  if (kcDefault >= kcMin && (kcDefault % alignK) == 0 && (K % kcDefault) == 0)
-    return kcDefault;
-  // Otherwise search downward.
-  for (int64_t kc = std::min(kcDefault, K); kc >= kcMin; --kc) {
-    if ((kc % alignK) == 0 && (K % kc) == 0)
-      return kc;
-  }
+
+  auto aligned = [&](int64_t x){
+    return alignK <= 1 || (x % alignK) == 0;
+  };
+
+  // Try divisors aligned first (closest to kcDefault).
+  for (int64_t kc = std::min(kcDefault, K); kc >= kcMin; --kc)
+    if ((K % kc) == 0 && aligned(kc)) return kc;
+
+  // Then accept any divisor ≥ kcMin. No alignment constraint unless explicitly
+  // needed for the ukernel unroll.
+  for (int64_t kc = std::min(kcDefault, K); kc >= kcMin; --kc)
+    if ((K % kc) == 0) return kc;
+
   return kcDefault;
 }
 
@@ -797,23 +802,24 @@ static GemmTileSizes computeGemmTiles(const mKInfo &mK, const ArchInfo &arch,
   ts.mr = std::max<int64_t>(mK.nrows, 4); // e.g., 4..16
   ts.nr = std::max<int64_t>(mK.ncols, 8); // e.g., 8..32
 
-  // Outer: pick Mc/Nc as a few microkernels; Kc as a reduction chunk.
+  // Outer: pick Mc/Nc as a few microkernels
   ts.Mc = ts.mr * 8;     // 8 microkernels stacked on M
   ts.Nc = ts.nr * 4;     // 4 microkernels stacked on N
-  ts.Kc = 128;           // conservative reduction chunk (maybe tuned by arch)
+
+  // Kc as a reduction chunk. select conservatively
+  ts.Kc = 128;  // maybe tuned by arch
 
   // If K is statically known, prefer a Kc that divides K to avoid padding in K.
   Value A = gemmOp.getDpsInputs()[0]; // [M,K]
   auto aTy = cast<RankedTensorType>(A.getType()); // A : [M x K]
   int64_t Kdim = aTy.getDimSize(/*K-dim index*/ 1);
   if (!ShapedType::isDynamic(Kdim)) {
-    // Keep Kc aligned to ukernel unroll; keep a reasonable lower bound.
-    int64_t alignK = 8;   // maybe adjusted to mK.nrows ?
-    int64_t kcMin  = 64;  // keep panels reasonably sized
+    int64_t alignK = 8;  // To keep Kc aligned to ukernel unroll
+    int64_t kcMin  = 64; // keep panels reasonably sized
     ts.Kc = chooseAdaptiveKc(Kdim, ts.Kc, kcMin, alignK);
   }
 
-  // We can refine later with arch.l2_size (VTCM-size ?).
+  // We can refine later with arch.l2_size
   (void)arch;
   return ts;
 }

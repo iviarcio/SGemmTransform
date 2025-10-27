@@ -38,7 +38,7 @@ readonly OUTPUT="$INPUT_DIR"/"$INPUT_BASE".opt.mlir
 
 # Optimize MLIR
 if [[ $NO_OUTPUT -eq 1 ]]; then
-  transform-opt -transform="$2" "$1"
+  sgemm-opt -transform="$2" "$1"
 else
-  transform-opt -transform="$2" "$1" >"$OUTPUT"
+  sgemm-opt -transform="$2" "$1" >"$OUTPUT"
 fi

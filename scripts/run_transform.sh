@@ -25,7 +25,7 @@ echo "Output file   : $OUTPUT_FILE"
 echo "============================================================"
 
 # Run transform-opt
-transform-opt -transform="$TRANSFORM_FILE" "$PAYLOAD_FILE" > "$OUTPUT_FILE"
+sgemm-opt -transform="$TRANSFORM_FILE" "$PAYLOAD_FILE" > "$OUTPUT_FILE"
 
 echo "Transform completed successfully!"
 echo "Output written to $OUTPUT_FILE"
