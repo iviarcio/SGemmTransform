@@ -765,21 +765,53 @@ static LogicalResult packAndRetargetUkernel(RewriterBase &rewriter,
 // Tiling Helpers
 //===----------------------------------------------------------------------===//
 
+/// Returns the largest panel size kc' such that:
+///  - kc' <= kcDefault (128)
+///  - K % kc' == 0
+///  - kc' is aligned to 'alignK' (e.g., unroll factor/vlen)
+///  - kc' >= kcMin (to avoid degenerate tiny panels)
+/// If no candidate is found, returns kcDefault.
+static int64_t chooseAdaptiveKc(int64_t K, int64_t kcDefault,
+                                int64_t kcMin = 64, int64_t alignK = 8) {
+  if (ShapedType::isDynamic(K)) return kcDefault; // cannot decide statically
+  // First try the default if it already divides K and is aligned.
+  if (kcDefault >= kcMin && (kcDefault % alignK) == 0 && (K % kcDefault) == 0)
+    return kcDefault;
+  // Otherwise search downward.
+  for (int64_t kc = std::min(kcDefault, K); kc >= kcMin; --kc) {
+    if ((kc % alignK) == 0 && (K % kc) == 0)
+      return kc;
+  }
+  return kcDefault;
+}
+
 /// Selects block (tiling) sizes for a GEMM at two levels  
-static GemmTileSizes computeGemmTiles(const mKInfo &mK, const ArchInfo &arch) {
+static GemmTileSizes computeGemmTiles(const mKInfo &mK, const ArchInfo &arch,
+                                      linalg::GenericOp gemmOp) {
 
   GemmTileSizes ts;
   // Map SConv-style knobs into GEMM intuitively:
   //   - mr <- nrows (rows of micro-kernel)
   //   - nr <- ncols (cols of micro-kernel)
-  //   - Choose outer tiles as multiples of mr/nr and a modest Kc.
+  //   - Choose outer tiles as multiples of mr/nr and a feasible Kc.
   ts.mr = std::max<int64_t>(mK.nrows, 4); // e.g., 4..16
   ts.nr = std::max<int64_t>(mK.ncols, 8); // e.g., 8..32
 
   // Outer: pick Mc/Nc as a few microkernels; Kc as a reduction chunk.
-  ts.Mc = ts.mr * 8;         // 8 microkernels stacked on M
-  ts.Nc = ts.nr * 4;         // 4 microkernels stacked on N
-  ts.Kc = 128;               // conservative reduction chunk (tune by arch)
+  ts.Mc = ts.mr * 8;     // 8 microkernels stacked on M
+  ts.Nc = ts.nr * 4;     // 4 microkernels stacked on N
+  ts.Kc = 128;           // conservative reduction chunk (maybe tuned by arch)
+
+  // If K is statically known, prefer a Kc that divides K to avoid padding in K.
+  Value A = gemmOp.getDpsInputs()[0]; // [M,K]
+  auto aTy = cast<RankedTensorType>(A.getType()); // A : [M x K]
+  int64_t Kdim = aTy.getDimSize(/*K-dim index*/ 1);
+  if (!ShapedType::isDynamic(Kdim)) {
+    // Keep Kc aligned to ukernel unroll; keep a reasonable lower bound.
+    int64_t alignK = 8;   // maybe adjusted to mK.nrows ?
+    int64_t kcMin  = 64;  // keep panels reasonably sized
+    ts.Kc = chooseAdaptiveKc(Kdim, ts.Kc, kcMin, alignK);
+  }
 
   // We can refine later with arch.l2_size (VTCM-size ?).
   (void)arch;
@@ -791,8 +823,7 @@ static GemmTileSizes computeGemmTiles(const mKInfo &mK, const ArchInfo &arch) {
 /// then, apply inner tiling (mr,0,nr) on the inner tiled op.
 static LogicalResult
 applyTileToGemm(RewriterBase &rewriter, Operation *transformOp, Operation *target,
-                const mKInfo &mK, const ArchInfo &arch,
-                SmallVector<Operation*, 6> &outResults) {
+                const GemmTileSizes &ts, SmallVector<Operation*, 6> &outResults) {
 
   SmallVector<Operation *> tiledOps;
   SmallVector<Operation *> loopOps;
@@ -802,8 +833,6 @@ applyTileToGemm(RewriterBase &rewriter, Operation *transformOp, Operation *targe
     return transformOp->emitError("only TilingInterface ops are supported");
 
   // Outer level: (Mc, Kc, Nc) over (i, k, j) with interchange {0,2,1} -> loops order (i, j, k).
-  GemmTileSizes ts = computeGemmTiles(mK, arch);
-
   SmallVector<int64_t, 3> outerTileSz = {ts.Mc, ts.Kc, ts.Nc};
   SmallVector<OpFoldResult> outerTileOfr =
       getAsIndexOpFoldResult(rewriter.getContext(), outerTileSz);
@@ -1022,7 +1051,7 @@ transform::SGemmOp::apply(transform::TransformRewriter &rewriter,
 
       linalg::GenericOp genericOp = *res;
       // Compute tile sizes once (we need them for padding multiples).
-      GemmTileSizes ts = computeGemmTiles(mK, arch);
+      GemmTileSizes ts = computeGemmTiles(mK, arch, genericOp);
 
       // Padding scaffolding: extract A/B/C, set IP, and build tensor.pad if needed.
       auto mpOr = preparePaddingForGemmLike(rewriter, genericOp, ts);
@@ -1060,7 +1089,7 @@ transform::SGemmOp::apply(transform::TransformRewriter &rewriter,
       SmallVector<Operation*, 6> localResults;
 
       // linalg::GenericOp genericOp = *res;
-      if (failed(applyTileToGemm(rewriter, getOperation(), genericOp.getOperation(), mK, arch, localResults)))
+      if (failed(applyTileToGemm(rewriter, getOperation(), genericOp.getOperation(), ts, localResults)))
         return emitSilenceableError() << "Failed to apply tiling.";
 
       // First result in localResults contains the tiled uKernel

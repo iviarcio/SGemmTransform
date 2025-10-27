@@ -17,7 +17,7 @@
 To apply the transformation (still without lowering to LLVM), use:
 
 ```bash
-transform-opt -transform=sgem.mlir payload.mlir
+sgemm-opt -transform=sgem.mlir payload.mlir
 ```
 
 This command loads the transform dialect and executes the operations defined in `sgem.mlir` on the payload `payload.mlir`. The pass searches for `linalg.matmul` operations modeling GEMM and applies the transformation.
@@ -78,7 +78,7 @@ This command loads the transform dialect and executes the operations defined in 
 * You can enable debug output for the pass with:
 
   ```bash
-  transform-opt ... -debug-only=SGemm
+  sgemm-opt ... -debug-only=SGemm
   ```
 
   The header defines `DEBUG_TYPE "sgemm"` and helper macros; use `DBGS()` in the code to print debug messages.
@@ -93,7 +93,7 @@ This command loads the transform dialect and executes the operations defined in 
 
 * Recommended testing flow:
 
-  1. `transform-opt -transform=sgem.mlir payload.mlir > transformed.mlir`
+  1. `sgemm-opt -transform=sgem.mlir payload.mlir > transformed.mlir`
   2. Inspect `transformed.mlir` for `tensor.pad`, cloned `linalg.generic`, packing ops, and the resulting micro-kernel.
   3. Optionally, apply the lowering passes (bufferize, convert-linalg-to-affine-loops, etc.) to validate full lowering and execute with `mlir-runner` (for result comparison).
 
